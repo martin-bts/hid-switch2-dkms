@@ -3,38 +3,59 @@
  * HID driver for Nintendo Switch controllers — BLE transport
  *
  * Implements the BLE transport for controllers connected via the BlueZ
- * procon2 plugin, which creates a uhid HID device and handles all
- * GATT-level communication.
+ * gatt-uhid bridge, which creates a uhid HID device and forwards all
+ * GATT traffic bidirectionally.
  *
- * This module is the entry point for the BLE path.  When the BlueZ plugin
- * creates the uhid device (BUS_BLUETOOTH, VID 0x057E, PID 0x2069), the
- * kernel fires a uevent that modprobe resolves to this module.  Loading
- * this module implicitly pulls in hid-switch2 as a dependency (via ELF
- * symbol references), mirroring the USB path where switch2-usb is the
- * entry point and hid-switch2 is its dependency.
+ * Report format (defined by gatt-uhid bridge):
+ *   byte 0:    HID report ID (0x01)
+ *   byte 1-2:  GATT handle, little-endian
+ *   byte 3+:   payload (raw GATT notification or command frame)
  *
- * send_command path (LED, grip, rumble-arm, …):
- *   Wraps the payload in a standard 0x91 frame with NS2_TRANS_BT and
- *   calls hid_hw_output_report().  The plugin forwards it as-is to
- *   GATT 0x0014.
+ * Input routing (by GATT handle):
+ *   - Input characteristic (e.g. 0x000e): 63-byte controller reports.
+ *     The payload is raw [seq][status][buttons...sticks...] with no
+ *     report type byte.  We prepend the report type (determined from
+ *     controller type) before passing to switch2_event().
+ *   - ACK characteristic (e.g. 0x001a): command responses with 0x91
+ *     framing.  Routed to switch2_receive_command().
+ *   - Other handles: logged and ignored.
  *
- * send_rumble path (per-frame haptic from switch2_rumble_work):
- *   Extracts the 5-byte left-channel HD-rumble encoding from the
- *   64-byte buffer produced by switch2_rumble_work, wraps it in a
- *   0x91 NS2_CMD_VIBRATE/0x02 frame, and calls hid_hw_output_report().
- *   The plugin forwards it to GATT 0x0014 where the controller plays
- *   it through its LRA haptic motor.
+ * Output path (send_command / send_rumble):
+ *   Prepends [handle_lo][handle_hi] to the 0x91 frame and calls
+ *   hid_hw_output_report().  The gatt-uhid bridge reads the handle
+ *   and writes the frame to that GATT characteristic.
  *
- *   GC (ERM motor, buf[0]==3): not implemented for BLE; returns 0.
- *
- * The vibrate-arm command (NS2_CMD_VIBRATE/0x02 + [0x01,0,0,0]) is
- * sent once after input registration via send_command in switch2_ble_probe.
+ * The init sequence, calibration, and input parsing are all handled by
+ * hid-switch2.c — this file only adapts the transport framing.
  */
 
 #include "hid-switch2.h"
 #include <linux/hid.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+
+/* GATT handle prefix size in bridge reports */
+#define GATT_HANDLE_SIZE	2
+
+/* GATT handle for the command/write characteristic.
+ * This is a property of the controller's GATT service layout. */
+#define NS2_GATT_CMD_HANDLE	0x0014
+
+/*
+ * Extended per-BLE-connection state.  Wraps the upstream switch2_ble
+ * (which contains cfg as its first member) with GATT handle routing.
+ */
+struct switch2_ble_ext {
+	struct switch2_ble base;	/* upstream struct, must be first */
+	uint16_t input_handle;		/* GATT handle for input notifications */
+	uint16_t ack_handle;		/* GATT handle for ACK notifications */
+	bool init_pending;		/* waiting for first raw_event to init */
+	struct work_struct init_work;	/* deferred init work */
+};
+
+/* ------------------------------------------------------------------ */
+/* Output: prepend GATT handle to outgoing frames                       */
+/* ------------------------------------------------------------------ */
 
 static int switch2_ble_send_cmd(enum switch2_cmd command, uint8_t subcommand,
 	const void *msg, size_t len, struct switch2_cfg_intf *intf)
@@ -45,6 +66,7 @@ static int switch2_ble_send_cmd(enum switch2_cmd command, uint8_t subcommand,
 		subcommand, 0, len
 	};
 	uint8_t *frame;
+	size_t frame_len;
 	int ret;
 
 	if (WARN_ON(len > 56))
@@ -53,15 +75,24 @@ static int switch2_ble_send_cmd(enum switch2_cmd command, uint8_t subcommand,
 	if (!ns2->hdev)
 		return -ENODEV;
 
-	frame = kzalloc(sizeof(header) + len, GFP_KERNEL);
+	frame_len = GATT_HANDLE_SIZE + sizeof(header) + len;
+	frame = kzalloc(frame_len, GFP_KERNEL);
 	if (!frame)
 		return -ENOMEM;
 
-	memcpy(frame, &header, sizeof(header));
-	if (msg && len)
-		memcpy(frame + sizeof(header), msg, len);
+	/* Little-endian GATT handle prefix */
+	frame[0] = NS2_GATT_CMD_HANDLE & 0xff;
+	frame[1] = (NS2_GATT_CMD_HANDLE >> 8) & 0xff;
 
-	ret = hid_hw_output_report(ns2->hdev, frame, sizeof(header) + len);
+	memcpy(frame + GATT_HANDLE_SIZE, &header, sizeof(header));
+	if (msg && len)
+		memcpy(frame + GATT_HANDLE_SIZE + sizeof(header), msg, len);
+
+	ret = hid_hw_output_report(ns2->hdev, frame, frame_len);
+	hid_info(ns2->hdev, "DBG send_cmd: cmd=0x%02x sub=0x%02x len=%zu ret=%d\n",
+		command, subcommand, frame_len, ret);
+	print_hex_dump(KERN_INFO, "DBG send_cmd frame: ", DUMP_PREFIX_NONE,
+		16, 1, frame, min(frame_len, (size_t)32), false);
 	kfree(frame);
 	return ret;
 }
@@ -70,15 +101,11 @@ static int switch2_ble_send_rumble(const uint8_t *buf, size_t len,
 	struct switch2_cfg_intf *intf)
 {
 	struct switch2_controller *ns2 = intf->parent;
-	/*
-	 * BLE haptic frame: 8-byte 0x91 header + 5-byte HD-rumble payload.
-	 * Subcmd 0x02 is the per-frame vibrate command (armed once at init).
-	 */
 	struct switch2_cmd_header header = {
 		NS2_CMD_VIBRATE, NS2_DIR_OUT | NS2_FLAG_OK, NS2_TRANS_BT,
 		0x02, 0, 5
 	};
-	uint8_t frame[sizeof(header) + 5];
+	uint8_t frame[GATT_HANDLE_SIZE + sizeof(header) + 5];
 
 	if (!ns2->hdev)
 		return -ENODEV;
@@ -86,33 +113,184 @@ static int switch2_ble_send_rumble(const uint8_t *buf, size_t len,
 	if (len < 7)
 		return -EINVAL;
 
-	/* buf[0]: controller type.  GC uses ERM — not implemented for BLE. */
+	/* GC uses ERM — not implemented for BLE */
 	if (buf[0] == 3)
 		return 0;
 
-	/*
-	 * JC (buf[0]==1) and PRO (buf[0]==2) both use HD rumble.
-	 * Extract the 5-byte left-channel encoding at buf[0x02..0x06].
-	 * PRO right channel (buf[0x12..0x16]) is ignored for now; both LRAs
-	 * receive the same pattern since switch2_rumble_work copies
-	 * ns2->rumble.hd to both sides anyway.
-	 */
-	memcpy(frame, &header, sizeof(header));
-	memcpy(frame + sizeof(header), &buf[0x02], 5);
+	/* Little-endian GATT handle prefix */
+	frame[0] = NS2_GATT_CMD_HANDLE & 0xff;
+	frame[1] = (NS2_GATT_CMD_HANDLE >> 8) & 0xff;
+
+	memcpy(frame + GATT_HANDLE_SIZE, &header, sizeof(header));
+	memcpy(frame + GATT_HANDLE_SIZE + sizeof(header), &buf[0x02], 5);
 
 	return hid_hw_output_report(ns2->hdev, frame, sizeof(frame));
 }
+
+/* ------------------------------------------------------------------ */
+/* Deferred init: triggered by first raw_event                           */
+/* ------------------------------------------------------------------ */
+
+static void switch2_ble_init_work(struct work_struct *work)
+{
+	struct switch2_ble_ext *ns2_ble =
+		container_of(work, struct switch2_ble_ext, init_work);
+	struct switch2_controller *ns2 = ns2_ble->base.cfg.parent;
+	int ret;
+
+	mutex_lock(&ns2->lock);
+	if (!ns2->hdev) {
+		mutex_unlock(&ns2->lock);
+		return;
+	}
+	hid_info(ns2->hdev, "DBG deferred init_controller, init_step=%d\n",
+		ns2->init_step);
+	ret = switch2_init_controller(ns2);
+	hid_info(ns2->hdev, "DBG deferred init_controller returned %d, init_step=%d\n",
+		ret, ns2->init_step);
+	if (ret < 0)
+		hid_err(ns2->hdev, "deferred init_controller failed %d\n", ret);
+	mutex_unlock(&ns2->lock);
+}
+
+/* ------------------------------------------------------------------ */
+/* Input: parse handle prefix, route to appropriate handler              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * raw_event callback.  hid-core passes the full report buffer including
+ * the report ID byte at raw_data[0].  Our bridge format is:
+ *   raw_data[0]    = report ID (0x01)
+ *   raw_data[1..2] = GATT handle, little-endian
+ *   raw_data[3+]   = payload
+ */
+static int switch2_ble_raw_event(struct hid_device *hdev,
+	struct hid_report *report, uint8_t *raw_data, int size)
+{
+	struct switch2_controller *ns2 = hid_get_drvdata(hdev);
+	struct switch2_ble_ext *ns2_ble = (struct switch2_ble_ext *)ns2->cfg;
+	uint16_t handle;
+	uint8_t *payload;
+	int payload_len;
+	int ret;
+	static unsigned int dbg_count;
+
+	if (report->type != HID_INPUT_REPORT)
+		return 0;
+
+	/* Skip report ID byte (raw_data[0]) */
+	if (size < 1 + GATT_HANDLE_SIZE + 1)
+		return -EINVAL;
+
+	/*
+	 * First raw_event means the BlueZ gatt-uhid bridge has its GLib
+	 * I/O watch active and can process UHID_OUTPUT events.  Kick off
+	 * init now — it's too early during probe (inside UHID_CREATE2).
+	 */
+	if (unlikely(ns2_ble->init_pending)) {
+		ns2_ble->init_pending = false;
+		schedule_work(&ns2_ble->init_work);
+	}
+
+	handle = raw_data[1] | ((uint16_t)raw_data[2] << 8);
+	payload = raw_data + 1 + GATT_HANDLE_SIZE;
+	payload_len = size - 1 - GATT_HANDLE_SIZE;
+
+	/* Log first few events and then every 256th */
+	if (dbg_count < 10 || (dbg_count % 256) == 0)
+		hid_info(hdev, "DBG raw_event: size=%d handle=0x%04x payload_len=%d "
+			"input_h=0x%04x ack_h=0x%04x init_step=%d count=%u\n",
+			size, handle, payload_len,
+			ns2_ble->input_handle, ns2_ble->ack_handle,
+			ns2->init_step, dbg_count);
+	dbg_count++;
+
+	if (handle == ns2_ble->ack_handle) {
+		/* ACK / command response — route to init state machine */
+		hid_info(hdev, "DBG ACK received: %d bytes, first=%02x\n",
+			payload_len, payload_len > 0 ? payload[0] : 0);
+		print_hex_dump(KERN_INFO, "DBG ACK data: ", DUMP_PREFIX_NONE,
+			16, 1, payload, min(payload_len, 32), false);
+		switch2_receive_command(ns2, payload, payload_len);
+		return 0;
+	}
+
+	if (handle == ns2_ble->input_handle) {
+		/*
+		 * Input report.  The raw GATT notification has no report type
+		 * byte — it starts with [seq][status][buttons...sticks...].
+		 * switch2_event() expects raw_data[0] to be the report type
+		 * (e.g. 0x09 for NS2_REPORT_PRO) with button/stick data at
+		 * the offsets used by the USB path.
+		 *
+		 * Prepend the report type byte determined by controller type,
+		 * and temporarily set report->id to match.
+		 */
+		uint8_t buf[64];
+		unsigned int orig_id = report->id;
+		uint8_t report_type;
+		struct input_dev *input;
+
+		switch (ns2->ctlr_type) {
+		case NS2_CTLR_TYPE_JCL:
+			report_type = NS2_REPORT_JCL;
+			break;
+		case NS2_CTLR_TYPE_JCR:
+			report_type = NS2_REPORT_JCR;
+			break;
+		case NS2_CTLR_TYPE_GC:
+			report_type = NS2_REPORT_GC;
+			break;
+		default:
+			report_type = NS2_REPORT_PRO;
+			break;
+		}
+
+		if (payload_len > (int)sizeof(buf) - 1)
+			payload_len = sizeof(buf) - 1;
+
+		buf[0] = report_type;
+		memcpy(&buf[1], payload, payload_len);
+
+		/* Log first few input events */
+		if (dbg_count < 15) {
+			rcu_read_lock();
+			input = rcu_dereference(ns2->input);
+			rcu_read_unlock();
+			hid_info(hdev, "DBG input: report_type=0x%02x "
+				"payload_len=%d has_input=%d\n",
+				report_type, payload_len, input != NULL);
+			print_hex_dump(KERN_INFO, "DBG input buf: ",
+				DUMP_PREFIX_NONE, 16, 1, buf,
+				min(payload_len + 1, 16), false);
+		}
+
+		report->id = report_type;
+		ret = switch2_event(hdev, report, buf, payload_len + 1);
+		report->id = orig_id;
+		return ret;
+	}
+
+	/* Other handles — log and ignore */
+	hid_info(hdev, "DBG unhandled handle 0x%04x, %d bytes\n", handle,
+		payload_len);
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Probe / remove                                                       */
+/* ------------------------------------------------------------------ */
 
 static int switch2_ble_probe(struct hid_device *hdev,
 	const struct hid_device_id *id)
 {
 	struct switch2_controller *ns2;
-	struct switch2_ble *ns2_ble;
+	struct switch2_ble_ext *ns2_ble;
 	char phys[64];
 	int ret;
-#ifdef CONFIG_SWITCH2_FF
-	static const uint8_t vibrate_arm[] = { 0x01, 0x00, 0x00, 0x00 };
-#endif
+
+	hid_info(hdev, "DBG probe start\n");
 
 	snprintf(phys, sizeof(phys), "bt%s", hdev->uniq);
 
@@ -124,12 +302,8 @@ static int switch2_ble_probe(struct hid_device *hdev,
 
 	/*
 	 * Do not expose a hidraw node for BLE controllers.  Steam/SDL would
-	 * otherwise write USB-format 0x91 commands (with a HID report-ID prefix
-	 * and NS2_TRANS_USB transport byte) directly to hidraw, bypassing
-	 * switch2_ble_send_rumble and sending malformed data to GATT 0x0014.
-	 * Without hidraw, Steam falls back to the evdev FF_RUMBLE interface
-	 * which goes through switch2_rumble_work → switch2_ble_send_rumble and
-	 * produces correctly-formatted BLE VIBRATE frames.
+	 * otherwise write USB-format 0x91 commands directly to hidraw,
+	 * bypassing the BLE transport framing.
 	 */
 	ret = hid_hw_start(hdev, 0);
 	if (ret) {
@@ -145,6 +319,7 @@ static int switch2_ble_probe(struct hid_device *hdev,
 
 	ns2 = switch2_get_controller(phys);
 	if (!ns2) {
+		hid_err(hdev, "DBG get_controller failed\n");
 		ret = -ENOMEM;
 		goto err_close;
 	}
@@ -161,56 +336,57 @@ static int switch2_ble_probe(struct hid_device *hdev,
 	ns2->player_id = U32_MAX;
 	ret = switch2_alloc_player_id();
 	if (ret < 0)
-		hid_warn(hdev, "Failed to allocate player ID, skipping; ret=%d\n", ret);
+		hid_warn(hdev, "Failed to allocate player ID; ret=%d\n", ret);
 	else
 		ns2->player_id = ret;
 
-	/*
-	 * BLE fast-path: the BlueZ procon2 plugin has already completed the
-	 * full initialization sequence.  Skip the USB transport rendezvous
-	 * and flash calibration reads.
-	 *
-	 * ctlr_type must be set before switch2_init_rumble (which checks for
-	 * NS2_CTLR_TYPE_GC).  Zero-initialised stick_calib means
-	 * switch2_report_axis() will use the "(value - 2048) * 16" fallback,
-	 * which is correct because the BlueZ plugin pre-normalises stick
-	 * values to centre=2048.
-	 */
-	ns2_ble->cfg.parent       = ns2;
-	ns2_ble->cfg.send_command = switch2_ble_send_cmd;
-	ns2_ble->cfg.send_rumble  = switch2_ble_send_rumble;
+	ns2_ble->base.cfg.parent       = ns2;
+	ns2_ble->base.cfg.send_command = switch2_ble_send_cmd;
+	ns2_ble->base.cfg.send_rumble  = switch2_ble_send_rumble;
 
-	ns2->ctlr_type = NS2_CTLR_TYPE_PRO;
-	ns2->cfg       = (struct switch2_cfg_intf *)ns2_ble;
-	ns2->init_step = NS2_INIT_DONE;
 	/*
-	 * The BlueZ plugin inverts Y (4095 - y) before packing the uhid
-	 * payload so that hid-generic sees correct axis direction.
-	 * Tell hid-switch2 not to negate Y a second time.
+	 * GATT handles for routing incoming notifications.
+	 * These are properties of the controller's GATT service layout.
+	 * The bridge forwards all notifications with the handle prefix,
+	 * so we can identify them here.
+	 *
+	 * TODO: these could be discovered from the bridge or passed via
+	 * a feature report instead of being hardcoded.
 	 */
-	ns2->y_pre_inverted = true;
+	ns2_ble->input_handle = 0x000e;
+	ns2_ble->ack_handle   = 0x001a;
+
+	ns2->cfg       = &ns2_ble->base.cfg;
+
+	/*
+	 * Let the full init state machine run (same as USB path).
+	 * init_step starts at 0 (NS2_INIT_NONE) from kzalloc.
+	 * switch2_receive_command() calls switch2_init_controller()
+	 * on each ACK, advancing through calibration reads etc.
+	 *
+	 * ctlr_type defaults to PRO; switch2_init_controller will
+	 * update it from firmware info during init.
+	 */
+	ns2->ctlr_type = NS2_CTLR_TYPE_PRO;
+
 #ifdef CONFIG_SWITCH2_FF
 	switch2_init_rumble(ns2);
 #endif
+
+	/*
+	 * Defer init until the first raw_event.  During probe we're inside
+	 * BlueZ's UHID_CREATE2 write — the GLib I/O watch on the uhid fd
+	 * isn't registered yet, so any UHID_OUTPUT we send now would be
+	 * queued but never read.  The first raw_event proves the bridge's
+	 * event loop is running and output will be delivered.
+	 */
+	INIT_WORK(&ns2_ble->init_work, switch2_ble_init_work);
+	ns2_ble->init_pending = true;
+
 	hid_set_drvdata(hdev, ns2);
 
-	ret = switch2_init_input(ns2);
-	if (ret) {
-		mutex_unlock(&ns2->lock);
-		goto err_close;
-	}
-
-#ifdef CONFIG_SWITCH2_FF
-	/*
-	 * Arm the HD-rumble engine.  Sent post-init via the uhid output path;
-	 * the BlueZ plugin forwards it to GATT 0x0014.
-	 */
-	if (ns2->ctlr_type != NS2_CTLR_TYPE_GC)
-		ns2->cfg->send_command(NS2_CMD_VIBRATE, 0x02,
-			vibrate_arm, sizeof(vibrate_arm), ns2->cfg);
-#endif
-
 	mutex_unlock(&ns2->lock);
+	hid_info(hdev, "DBG probe complete\n");
 	return 0;
 
 err_put:
@@ -225,6 +401,7 @@ err_stop:
 static void switch2_ble_remove(struct hid_device *hdev)
 {
 	struct switch2_controller *ns2 = hid_get_drvdata(hdev);
+	struct switch2_ble_ext *ns2_ble = (struct switch2_ble_ext *)ns2->cfg;
 #ifdef CONFIG_SWITCH2_FF
 	unsigned long flags;
 
@@ -232,6 +409,11 @@ static void switch2_ble_remove(struct hid_device *hdev)
 	cancel_delayed_work_sync(&ns2->rumble_work);
 	spin_unlock_irqrestore(&ns2->rumble_lock, flags);
 #endif
+	/* Ensure deferred init isn't running or pending */
+	if (ns2_ble)
+		cancel_work_sync(&ns2_ble->init_work);
+
+	hid_info(hdev, "DBG remove\n");
 	mutex_lock(&ns2->lock);
 	ns2->hdev  = NULL;
 	ns2->cfg   = NULL;
@@ -242,8 +424,12 @@ static void switch2_ble_remove(struct hid_device *hdev)
 	hid_hw_stop(hdev);
 }
 
+/* ------------------------------------------------------------------ */
+/* Module registration                                                  */
+/* ------------------------------------------------------------------ */
+
 static const struct hid_device_id switch2_ble_devices[] = {
-	/* uhid devices created by BlueZ plugins for BLE connections.
+	/* uhid devices created by BlueZ gatt-uhid bridge for BLE connections.
 	 * GameCube (0x2073) is wired-only and intentionally omitted. */
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
 			       USB_DEVICE_ID_NINTENDO_NS2_JOYCONL) },
@@ -260,7 +446,7 @@ static struct hid_driver switch2_ble_hid_driver = {
 	.id_table  = switch2_ble_devices,
 	.probe     = switch2_ble_probe,
 	.remove    = switch2_ble_remove,
-	.raw_event = switch2_event,
+	.raw_event = switch2_ble_raw_event,
 };
 module_hid_driver(switch2_ble_hid_driver);
 
