@@ -795,10 +795,10 @@ static void switch2_report_axis(struct input_dev *input, struct switch2_axis_cal
 }
 
 static void switch2_report_stick(struct input_dev *input, struct switch2_stick_calibration *calib,
-	int x, int y, const uint8_t *data, bool negate_y)
+	int x, int y, const uint8_t *data)
 {
 	switch2_report_axis(input, &calib->x, x, data[0] | ((data[1] & 0x0F) << 8), false);
-	switch2_report_axis(input, &calib->y, y, (data[1] >> 4) | (data[2] << 4), negate_y);
+	switch2_report_axis(input, &calib->y, y, (data[1] >> 4) | (data[2] << 4), true);
 }
 
 static void switch2_report_trigger(struct input_dev *input, uint8_t zero, int abs, uint8_t data)
@@ -842,13 +842,11 @@ int switch2_event(struct hid_device *hdev, struct hid_report *report, uint8_t *r
 		input_report_abs(input, ABS_HAT0Y,
 			!!(raw_data[3] & NS2_BTNL_DOWN) -
 			!!(raw_data[3] & NS2_BTNL_UP));
-		switch2_report_stick(input, &ns2->stick_calib[0], ABS_X, ABS_Y, &raw_data[6],
-			!ns2->y_pre_inverted);
+		switch2_report_stick(input, &ns2->stick_calib[0], ABS_X, ABS_Y, &raw_data[6]);
 		switch2_report_buttons(input, &raw_data[3], left_joycon_button_mappings);
 		break;
 	case NS2_REPORT_JCR:
-		switch2_report_stick(input, &ns2->stick_calib[0], ABS_RX, ABS_RY, &raw_data[6],
-			!ns2->y_pre_inverted);
+		switch2_report_stick(input, &ns2->stick_calib[0], ABS_RX, ABS_RY, &raw_data[6]);
 		switch2_report_buttons(input, &raw_data[3], right_joycon_button_mappings);
 		break;
 	case NS2_REPORT_GC:
@@ -859,10 +857,8 @@ int switch2_event(struct hid_device *hdev, struct hid_report *report, uint8_t *r
 			!!(raw_data[4] & NS2_BTNL_DOWN) -
 			!!(raw_data[4] & NS2_BTNL_UP));
 		switch2_report_buttons(input, &raw_data[3], gccon_mappings);
-		switch2_report_stick(input, &ns2->stick_calib[0], ABS_X, ABS_Y, &raw_data[6],
-			!ns2->y_pre_inverted);
-		switch2_report_stick(input, &ns2->stick_calib[1], ABS_RX, ABS_RY, &raw_data[9],
-			!ns2->y_pre_inverted);
+		switch2_report_stick(input, &ns2->stick_calib[0], ABS_X, ABS_Y, &raw_data[6]);
+		switch2_report_stick(input, &ns2->stick_calib[1], ABS_RX, ABS_RY, &raw_data[9]);
 		switch2_report_trigger(input, ns2->lt_zero, ABS_Z, raw_data[13]);
 		switch2_report_trigger(input, ns2->rt_zero, ABS_RZ, raw_data[14]);
 		break;
@@ -874,10 +870,8 @@ int switch2_event(struct hid_device *hdev, struct hid_report *report, uint8_t *r
 			!!(raw_data[4] & NS2_BTNL_DOWN) -
 			!!(raw_data[4] & NS2_BTNL_UP));
 		switch2_report_buttons(input, &raw_data[3], procon_mappings);
-		switch2_report_stick(input, &ns2->stick_calib[0], ABS_X, ABS_Y, &raw_data[6],
-			!ns2->y_pre_inverted);
-		switch2_report_stick(input, &ns2->stick_calib[1], ABS_RX, ABS_RY, &raw_data[9],
-			!ns2->y_pre_inverted);
+		switch2_report_stick(input, &ns2->stick_calib[0], ABS_X, ABS_Y, &raw_data[6]);
+		switch2_report_stick(input, &ns2->stick_calib[1], ABS_RX, ABS_RY, &raw_data[9]);
 		break;
 	default:
 		return -EINVAL;
@@ -922,8 +916,8 @@ static int switch2_probe(struct hid_device *hdev, const struct hid_device_id *id
 	}
 
 	ns2 = switch2_get_controller(phys);
-	if (!ns2) {
-		ret = -ENOMEM;
+	if (IS_ERR(ns2)) {
+		ret = PTR_ERR(ns2);
 		goto err_close;
 	}
 

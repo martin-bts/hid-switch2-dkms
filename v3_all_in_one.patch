@@ -1,0 +1,1072 @@
+diff --git a/Makefile.plugins b/Makefile.plugins
+index c9efadb45..4c5d10a90 100644
+--- a/Makefile.plugins
++++ b/Makefile.plugins
+@@ -1,4 +1,9 @@
+ # SPDX-License-Identifier: GPL-2.0
++builtin_sources += plugins/gatt-uhid.h plugins/gatt-uhid.c
++
++builtin_modules += switch2
++builtin_sources += plugins/switch2.c
++
+ builtin_modules += hostname
+ builtin_sources += plugins/hostname.c
+ 
+diff --git a/peripheral/gatt.c b/peripheral/gatt.c
+index d1ddf0c97..2af67f24a 100644
+--- a/peripheral/gatt.c
++++ b/peripheral/gatt.c
+@@ -121,7 +121,8 @@ static struct gatt_conn *gatt_conn_new(int fd)
+ 		return NULL;
+ 	}
+ 
+-	conn->client = bt_gatt_client_new(gatt_cache, conn->att, mtu, 0);
++	conn->client = bt_gatt_client_new(gatt_cache, conn->att, mtu, 0,
++								false);
+ 	if (!conn->gatt) {
+ 		fprintf(stderr, "Failed to create GATT client\n");
+ 		bt_gatt_server_unref(conn->gatt);
+diff --git a/plugins/gatt-uhid.c b/plugins/gatt-uhid.c
+new file mode 100644
+index 000000000..2f81812fe
+--- /dev/null
++++ b/plugins/gatt-uhid.c
+@@ -0,0 +1,350 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ *  BlueZ - Bluetooth protocol stack for Linux
++ *
++ *  Generic GATT-to-UHID bridge
++ *  Bridges a BLE GATT service to the kernel HID subsystem via /dev/uhid.
++ *
++ *  Report format (both directions):
++ *    byte 0:    HID report ID (0x01)
++ *    byte 1-2:  GATT handle, little-endian
++ *    byte 3+:   payload
++ *
++ *  Input:  bridge prepends [report_id][handle_lo][handle_hi] to the raw
++ *          GATT notification payload.
++ *  Output: bridge reads [report_id][handle_lo][handle_hi] from the HID
++ *          output report and writes the remaining payload to that GATT
++ *          handle via write-without-response.
++ *
++ *  The HID report descriptor uses a vendor-defined usage page with a
++ *  single input and output report, each sized for the 2-byte handle
++ *  prefix plus the maximum payload.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <linux/uhid.h>
++
++#include <glib.h>
++
++#include "src/log.h"
++#include "src/shared/att.h"
++#include "src/shared/gatt-client.h"
++#include "src/shared/util.h"
++
++#include "plugins/gatt-uhid.h"
++
++#define GATT_UHID_REPORT_ID	0x01
++
++/* Handle prefix overhead added to every report */
++#define GATT_UHID_HANDLE_SIZE	2
++
++/*
++ * The struct representing a GATT_UHID-Bridge.
++ */
++struct gatt_uhid {
++	struct bt_gatt_client *client;
++
++	int fd; /* /dev/uhid file descriptor */
++	guint watch_id; /* GLib I/O watch for UHID_OUTPUT */
++
++	unsigned int *notify_ids; /* registered GATT notify IDs */
++	unsigned int notify_count;
++
++	unsigned int cccd_pending; /* CCCDs not yet confirmed */
++};
++
++
++/*
++ * A prototypical HID report descriptor.
++ *
++ * One input and one output report, each sized for the 2-byte handle
++ * prefix plus the maximum payload.  The two Report Count fields
++ * (marked 0x00, 0x00) are patched at runtime.
++ */
++static const uint8_t hid_desc_template[] = {
++	0x06, 0x00, 0xff, /* Usage Page; Vendor Defined; no hid-generic */
++	0x09, 0x01, /* Usage; we are a vendor */
++	0xa1, 0x01, /* Collection; <hid_descriptor> */
++
++	/* Input report */
++	0x85, GATT_UHID_REPORT_ID,
++	0x09, 0x01,		/* Usage */
++	0x15, 0x00,		/* Logical Minimum (0) */
++	0x26, 0xff, 0x00,	/* Logical Maximum (255) */
++	0x75, 0x08,		/* Report Size (8) */
++	0x96, 0x00, 0x00,	/* Put max input size here! */
++	0x81, 0x02,		/* Input (Data, Variable, Absolute) */
++
++	/* Output report */
++	0x85, GATT_UHID_REPORT_ID,
++	0x09, 0x02,		/* Usage */
++	0x75, 0x08,		/* Report Size (8) */
++	0x96, 0x00, 0x00,	/* Put max output size here! */
++	0x91, 0x02,		/* Output (Data, Variable, Absolute) */
++
++	0xc0,			/* End Collection; </hid_descriptor> */
++};
++
++/* Offsets used to put device max sizes into hid_desc_template */
++#define HID_DESC_MAX_INPUT_OFFSET 19
++#define HID_DESC_MAX_OUTPUT_OFFSET 30
++
++static size_t build_hid_descriptor(uint8_t *buf, uint16_t input_size,
++							uint16_t output_size)
++{
++	uint16_t in_total = GATT_UHID_HANDLE_SIZE + input_size;
++	uint16_t out_total = GATT_UHID_HANDLE_SIZE + output_size;
++
++	memcpy(buf, hid_desc_template, sizeof(hid_desc_template));
++
++	/* little endian! */
++	buf[HID_DESC_MAX_INPUT_OFFSET] = in_total & 0xff;
++	buf[HID_DESC_MAX_INPUT_OFFSET + 1] = (in_total >> 8) & 0xff;
++
++	buf[HID_DESC_MAX_OUTPUT_OFFSET] = out_total & 0xff;
++	buf[HID_DESC_MAX_OUTPUT_OFFSET + 1] = (out_total >> 8) & 0xff;
++
++	return sizeof(hid_desc_template);
++}
++
++/* Create device using params from device specific plugin */
++static int uhid_create(const struct gatt_uhid_params *params)
++{
++	struct uhid_event ev = {};
++	uint8_t hid_desc[128];
++	size_t hid_desc_len;
++	int fd;
++
++	fd = open("/dev/uhid", O_RDWR | O_CLOEXEC);
++	if (fd < 0) {
++		error("gatt-uhid: open /dev/uhid: %s", strerror(errno));
++		return -1;
++	}
++
++	hid_desc_len = build_hid_descriptor(hid_desc,
++					params->input_size,
++					params->output_size);
++
++	ev.type = UHID_CREATE2;
++	ev.u.create2.bus = BUS_BLUETOOTH;
++	ev.u.create2.vendor = params->vendor;
++	ev.u.create2.product = params->product;
++	ev.u.create2.version = params->version;
++	ev.u.create2.country = 0;
++	ev.u.create2.rd_size = hid_desc_len;
++	strncpy((char *) ev.u.create2.name, params->name, 127);
++	memcpy(ev.u.create2.rd_data, hid_desc, hid_desc_len);
++
++	if (write(fd, &ev, sizeof(ev)) < 0) {
++		error("gatt-uhid: UHID_CREATE2: %s", strerror(errno));
++		close(fd);
++		return -1;
++	}
++
++	DBG("gatt-uhid: uhid device created (%s)", params->name);
++	return fd;
++}
++
++/*
++ * From HID to BLE device
++ *
++ * UHID_OUTPUT data from the kernel HID driver:
++ *   byte 0-1:  GATT handle, little-endian
++ *   byte 2+:   payload to write
++ */
++static gboolean uhid_output_cb(GIOChannel *io, GIOCondition cond,
++							gpointer user_data)
++{
++	struct gatt_uhid *bridge = user_data;
++	struct uhid_event ev;
++	uint16_t handle;
++	ssize_t n;
++
++	if (cond & (G_IO_ERR | G_IO_HUP | G_IO_NVAL)) {
++		DBG("gatt-uhid: output_cb error/hup/nval cond=0x%x",
++								(int) cond);
++		bridge->watch_id = 0;
++		return FALSE;
++	}
++
++	n = read(bridge->fd, &ev, sizeof(ev)); /* fetch the event */
++	if (n < 0 || (size_t) n < sizeof(ev)) {
++		DBG("gatt-uhid: output_cb read returned %zd", n);
++		return TRUE;
++	}
++
++	DBG("gatt-uhid: output_cb event type=%u size=%u",
++					ev.type, ev.u.output.size);
++
++	if (ev.type != UHID_OUTPUT) {
++		DBG("gatt-uhid: output_cb ignoring event type %u", ev.type);
++		return TRUE;
++	}
++
++	if (!bridge->client) {
++		DBG("gatt-uhid: output_cb no client");
++		return TRUE;
++	}
++
++	/* Need at least the 2-byte handle prefix */
++	if (ev.u.output.size < GATT_UHID_HANDLE_SIZE) {
++		DBG("gatt-uhid: output_cb too short: %u", ev.u.output.size);
++		return TRUE;
++	}
++
++	handle = ev.u.output.data[0] | ((uint16_t) ev.u.output.data[1] << 8);
++
++	if (!handle) {
++		DBG("gatt-uhid: output_cb handle is zero");
++		return TRUE;
++	}
++
++	bt_gatt_client_write_without_response(bridge->client,
++				handle, false,
++				ev.u.output.data + GATT_UHID_HANDLE_SIZE,
++				ev.u.output.size - GATT_UHID_HANDLE_SIZE);
++	return TRUE;
++}
++
++
++/*
++ * From BLE device to HID
++ *
++ * Input report format to kernel HID driver:
++ *   byte 0:    report ID (0x01)
++ *   byte 1-2:  GATT handle, little-endian
++ *   byte 3+:   raw notification payload
++ */
++static void notify_cb(uint16_t value_handle, const uint8_t *value,
++			uint16_t length, void *user_data)
++{
++	struct gatt_uhid *bridge = user_data;
++	struct uhid_event ev = {};
++
++	if (length == 0 || bridge->fd < 0)
++		return;
++
++	/* Don't forward until all CCCDs are confirmed, so we don't have
++	 * to deal with **some** available handles. */
++	if (bridge->cccd_pending)
++		return;
++
++	ev.type = UHID_INPUT2;
++	ev.u.input2.size = 1 + GATT_UHID_HANDLE_SIZE + length;
++	ev.u.input2.data[0] = GATT_UHID_REPORT_ID;
++	ev.u.input2.data[1] = value_handle & 0xff;
++	ev.u.input2.data[2] = (value_handle >> 8) & 0xff;
++	memcpy(&ev.u.input2.data[3], value, length);
++
++	if (write(bridge->fd, &ev, sizeof(ev)) < 0)
++		error("gatt-uhid: uhid write: %s", strerror(errno));
++}
++
++/* We can react to every single subscription on_registered */
++static void notify_registered_cb(uint16_t att_ecode, void *user_data)
++{
++	struct gatt_uhid *bridge = user_data;
++
++	if (att_ecode) {
++		error("gatt-uhid: notify registration failed: 0x%04x",
++								att_ecode);
++	}
++
++	if (bridge->cccd_pending > 0)
++		bridge->cccd_pending--;
++
++	if (bridge->cccd_pending == 0)
++		DBG("gatt-uhid: all %u CCCDs confirmed, forwarding input",
++						bridge->notify_count);
++}
++
++/*
++ * Public API
++ */
++
++struct gatt_uhid *gatt_uhid_new(struct bt_gatt_client *client,
++				const struct gatt_uhid_params *params)
++{
++	struct gatt_uhid *bridge;
++	GIOChannel *io;
++	unsigned int c;
++
++	if (!client || !params || !params->notify_count)
++		return NULL;
++
++	/* Create bridge */
++	bridge = g_new0(struct gatt_uhid, 1);
++	bridge->client = client;
++	bridge->notify_count = params->notify_count;
++	bridge->notify_ids = g_new0(unsigned int, params->notify_count);
++
++	bridge->fd = uhid_create(params); /* Create hid device */
++	if (bridge->fd < 0) {
++		g_free(bridge->notify_ids);
++		g_free(bridge);
++		return NULL;
++	}
++
++	/* Watch for UHID_OUTPUT events (commands from kernel HID driver) */
++	io = g_io_channel_unix_new(bridge->fd);
++	g_io_channel_set_encoding(io, NULL, NULL);
++	g_io_channel_set_buffered(io, FALSE);
++	bridge->watch_id = g_io_add_watch(io, G_IO_IN | G_IO_ERR | G_IO_HUP,
++							uhid_output_cb, bridge);
++	g_io_channel_unref(io);
++
++	/* Subscribe to all GATT notification handles. */
++	bridge->cccd_pending = params->notify_count;
++	for (c = 0; c < params->notify_count; c++) {
++		bridge->notify_ids[c] = bt_gatt_client_register_notify(
++					client,
++					params->notify_handles[c],
++					notify_registered_cb,
++					notify_cb,
++					bridge, NULL);
++		if (!bridge->notify_ids[c])
++			error("gatt-uhid: failed to register notify "
++				"for handle 0x%04x", params->notify_handles[c]);
++	}
++
++	return bridge;
++}
++
++void gatt_uhid_free(struct gatt_uhid *bridge)
++{
++	struct uhid_event ev = {};
++	unsigned int c;
++
++	if (!bridge)
++		return;
++
++	for (c = 0; c < bridge->notify_count; c++) {
++		if (bridge->notify_ids[c] && bridge->client)
++			bt_gatt_client_unregister_notify(bridge->client,
++						bridge->notify_ids[c]);
++	}
++
++	if (bridge->watch_id)
++		g_source_remove(bridge->watch_id);
++
++	if (bridge->fd >= 0) {
++		ev.type = UHID_DESTROY;
++		if (write(bridge->fd, &ev, sizeof(ev)) < 0)
++			error("gatt-uhid: UHID_DESTROY: %s", strerror(errno));
++		close(bridge->fd);
++	}
++
++	g_free(bridge->notify_ids);
++	g_free(bridge);
++}
+diff --git a/plugins/gatt-uhid.h b/plugins/gatt-uhid.h
+new file mode 100644
+index 000000000..6b5e65f3b
+--- /dev/null
++++ b/plugins/gatt-uhid.h
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ *  BlueZ - Bluetooth protocol stack for Linux
++ *
++ *  Generic GATT-to-UHID bridge
++ *  Bridges a BLE GATT service to the kernel HID subsystem via /dev/uhid.
++ *
++ *  GATT notifications are forwarded as HID input reports; ble->bluez->uhid
++ *  HID output reports are forwarded back as GATT writes; hid->bluez->ble
++ *
++ *  The bridge is device-agnostic — all protocol knowledge lives in the
++ *  kernel HID driver that claims the uhid device by vendor/product ID.
++ *
++ *  This lets the kernel driver identify which characteristic produced
++ *  each input report, and target specific handles for output writes.
++ */
++
++#include <stdint.h>
++#include <stdbool.h>
++
++struct gatt_uhid;
++struct bt_gatt_client;
++
++/*
++ * Device specific plugins provide a gatt_uhid_params to
++ * configure the bridge.
++ *
++ * All GATT handles are value handles (not CCCD handles).
++ */
++struct gatt_uhid_params {
++	const char *name; /* Shown device name */
++	uint16_t vendor;  /* Vendor ID like USB VID. Use this to match */
++	uint16_t product; /* Product ID like USB PID. Use this to match */
++	uint16_t version;
++
++	uint16_t *notify_handles;  /* array of notification value handles */
++	unsigned int notify_count; /* number of entries in notify_handles */
++
++	/* Max payload sizes (excluding report ID and 2-byte handle prefix).*/
++	uint16_t input_size;  /* size of a notification from BLE */
++	uint16_t output_size; /* size of an output from HID */
++};
++
++/*
++ * Create a GATT-UHID bridge.  Opens /dev/uhid, creates the device,
++ * and subscribes to the specified GATT notification handles.
++ * Returns NULL on failure.
++ */
++struct gatt_uhid *gatt_uhid_new(struct bt_gatt_client *client,
++				const struct gatt_uhid_params *params);
++
++/*
++ * Destroy the bridge — unsubscribes GATT notifications, sends
++ * UHID_DESTROY, and frees resources.
++ */
++void gatt_uhid_free(struct gatt_uhid *bridge);
+diff --git a/plugins/switch2.c b/plugins/switch2.c
+new file mode 100644
+index 000000000..0e389cab1
+--- /dev/null
++++ b/plugins/switch2.c
+@@ -0,0 +1,255 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ *  BlueZ - Bluetooth protocol stack for Linux
++ *
++ *  Nintendo Switch 2 controller BLE plugin
++ *
++ *  Thin device-specific wrapper around the generic GATT-UHID bridge.
++ *  Provides the GATT service UUID, characteristic discovery, and
++ *  vendor/product IDs for uhid device matching.
++ *
++ *  This wires the BLE device(s) so that HID drivers can take over.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++
++#include <glib.h>
++
++#include "bluetooth/bluetooth.h"
++#include "bluetooth/uuid.h"
++
++#include "src/adapter.h"
++#include "src/device.h"
++#include "src/profile.h"
++#include "src/service.h"
++#include "src/plugin.h"
++#include "src/log.h"
++#include "src/shared/att.h"
++#include "src/shared/gatt-client.h"
++#include "src/shared/gatt-db.h"
++
++#include "plugins/gatt-uhid.h"
++
++/*
++ * Hard facts about Nintendo and the Switch 2 controllers
++ */
++
++#define SWITCH2_SERVICE_UUID "ab7de9be-89fe-49ad-828f-118f09df7fd0"
++
++#define NS2_VID           0x057e /* Nintendo Vendor ID */
++#define NS2_PID_JOYCON_R  0x2066
++#define NS2_PID_JOYCON_L  0x2067
++#define NS2_PID_PROCON    0x2069
++#define NS2_PID_GCCON        0x2073
++
++#define NS2_INPUT_SIZE    63 /* Max observed on Procon2 in bytes */
++#define NS2_OUTPUT_SIZE   64 /* Max observed on Procon2; no off by one */
++
++#define NS2_MAX_NOTIFY    8 /* Max |notify characteristics in the service| */
++
++struct switch2_ctlr_info {
++	uint16_t    pid;
++	const char *alias;
++};
++
++static const struct switch2_ctlr_info ctlr_table[] = {
++	{ NS2_PID_PROCON,   "Nintendo Switch 2 Pro Controller" },
++	{ NS2_PID_JOYCON_L, "Nintendo Switch 2 Joy-Con (L)" },
++	{ NS2_PID_JOYCON_R, "Nintendo Switch 2 Joy-Con (R)" },
++	{ NS2_PID_GCCON,    "Nintendo Switch 2 GameCube Controller" },
++};
++
++/* Struct representing a controller */
++struct switch2_device {
++	struct btd_device    *device;
++	struct gatt_uhid     *bridge;
++	const struct switch2_ctlr_info *info;
++};
++
++/*
++ * GATT characteristic discovery
++ */
++
++/* We iterate gatt_db_foreach_service->gatt_db_service_foreach_char->inspect.
++ * Collect progress in char_walk_state */
++struct char_walk_state {
++	uint16_t   notify_handles[NS2_MAX_NOTIFY];
++	unsigned int notify_count;
++};
++
++static void inspect_char(struct gatt_db_attribute *attr, void *user_data)
++{
++	struct char_walk_state *state = user_data;
++	uint16_t handle, value_handle;
++	uint8_t properties;
++
++	if (!gatt_db_attribute_get_char_data(attr, &handle, &value_handle,
++						&properties, NULL, NULL))
++		return;
++
++	/* Collect every characteristic that supports notification */
++	if ((properties & 0x10) &&
++			state->notify_count < NS2_MAX_NOTIFY) {
++		state->notify_handles[state->notify_count++] = value_handle;
++	}
++}
++
++static void find_chars_in_service(struct gatt_db_attribute *service,
++							void *user_data)
++{
++	gatt_db_service_foreach_char(service, inspect_char, user_data);
++}
++
++/*
++ * Plugin functions
++ */
++
++static int switch2_probe(struct btd_service *service)
++{
++	struct btd_device *device = btd_service_get_device(service);
++	uint16_t pid = btd_device_get_product(device);
++	struct switch2_device *dev;
++	unsigned int c;
++
++	DBG("switch2: probe %s", device_get_path(device));
++
++	dev = g_new0(struct switch2_device, 1);
++	dev->device = btd_device_ref(device);
++	dev->info = &ctlr_table[0]; /* default to Procon 2 */
++
++	for (c = 0; c < G_N_ELEMENTS(ctlr_table); c++) {
++		if (ctlr_table[c].pid == pid) {
++			dev->info = &ctlr_table[c];
++			break;
++		}
++	}
++
++	DBG("switch2: detected %s (pid=0x%04x)", dev->info->alias, pid);
++
++	btd_device_set_alias(device, dev->info->alias);
++	btd_device_set_skip_secondary(device, true);
++
++	btd_service_set_user_data(service, dev);
++
++	return 0;
++}
++
++static void switch2_remove(struct btd_service *service)
++{
++	struct switch2_device *dev = btd_service_get_user_data(service);
++
++	DBG("switch2: remove %s", device_get_path(dev->device));
++
++	btd_device_unref(dev->device);
++	g_free(dev);
++}
++
++static int switch2_accept(struct btd_service *service)
++{
++	struct switch2_device *dev = btd_service_get_user_data(service);
++	struct btd_device *device  = btd_service_get_device(service);
++	struct bt_gatt_client *client;
++	struct gatt_db *db;
++	struct char_walk_state state;
++	bt_uuid_t service_uuid;
++	struct gatt_uhid_params params;
++
++	DBG("switch2: accept %s", device_get_path(device));
++
++	client = btd_device_get_gatt_client(device);
++	if (!client) {
++		error("switch2: no GATT client");
++		return -EINVAL;
++	}
++
++	/* NS2 controllers reject pairing; avoid pairing */
++	bt_gatt_client_set_security(client, BT_SECURITY_LOW);
++
++	/* Low-latency connection, otherwise unplayable */
++	btd_device_set_conn_param(device, 6, 6, 0, 200);
++
++	/* Discover GATT characteristics */
++	memset(&state, 0, sizeof(state));
++
++	db = btd_device_get_gatt_db(device);
++	bt_string_to_uuid(&service_uuid, SWITCH2_SERVICE_UUID);
++	gatt_db_foreach_service(db, &service_uuid,
++					find_chars_in_service, &state);
++
++	if (!state.notify_count) {
++		error("switch2: no notify characteristics found");
++		return -ENOENT;
++	}
++
++	/* Set up the GATT-UHID bridge */
++	memset(&params, 0, sizeof(params));
++	/* Static info */
++	params.version = 0x0001;
++	params.vendor = NS2_VID;
++	params.input_size = NS2_INPUT_SIZE;
++	params.output_size = NS2_OUTPUT_SIZE;
++	/* Our dev->info override in _probe() */
++	params.name = dev->info->alias;
++	params.product = dev->info->pid;
++	/* Discovered handles at runtime */
++	params.notify_handles = state.notify_handles;
++	params.notify_count = state.notify_count;
++
++	dev->bridge = gatt_uhid_new(client, &params);
++	if (!dev->bridge) {
++		error("switch2: failed to create GATT-UHID bridge");
++		return -EIO;
++	}
++
++	btd_service_connecting_complete(service, 0);
++	return 0;
++}
++
++static int switch2_disconnect(struct btd_service *service)
++{
++	struct switch2_device *dev = btd_service_get_user_data(service);
++
++	DBG("switch2: disconnect %s", device_get_path(dev->device));
++
++	gatt_uhid_free(dev->bridge);
++	dev->bridge = NULL;
++
++	btd_service_disconnecting_complete(service, 0);
++	return 0;
++}
++
++/*
++ * Plug in the plugin
++ */
++
++static struct btd_profile switch2_profile = {
++	.name = "switch2",
++	.bearer = BTD_PROFILE_BEARER_LE,
++	.remote_uuid = SWITCH2_SERVICE_UUID,
++	.device_probe = switch2_probe,
++	.device_remove = switch2_remove,
++	.accept = switch2_accept,
++	.disconnect = switch2_disconnect,
++	.auto_connect = true,
++};
++
++static int switch2_init(void)
++{
++	return btd_profile_register(&switch2_profile);
++}
++
++static void switch2_exit(void)
++{
++	btd_profile_unregister(&switch2_profile);
++}
++
++BLUETOOTH_PLUGIN_DEFINE(switch2, VERSION, BLUETOOTH_PLUGIN_PRIORITY_DEFAULT,
++						switch2_init, switch2_exit)
+diff --git a/src/dbus-common.c b/src/dbus-common.c
+index 5e2c83d52..42539116a 100644
+--- a/src/dbus-common.c
++++ b/src/dbus-common.c
+@@ -144,6 +144,8 @@ const char *gap_appearance_to_icon(uint16_t appearance)
+ 			return "scanner";
+ 		}
+ 		break;
++	case 0x2a: /* Gaming — Assigned Numbers, section 2.6.2 */
++		return "input-gaming";
+ 	}
+ 
+ 	return NULL;
+diff --git a/src/device.c b/src/device.c
+index 3ea683667..0a88b82a2 100644
+--- a/src/device.c
++++ b/src/device.c
+@@ -213,6 +213,7 @@ struct btd_device {
+ 	bool		pending_paired;		/* "Paired" waiting for SDP */
+ 	bool		svc_refreshed;
+ 	bool		refresh_discovery;
++	bool		skip_secondary;
+ 
+ 	/* Manage whether this device can wake the system from suspend.
+ 	 * - wake_support: Requires a profile that supports wake (i.e. HID)
+@@ -1062,17 +1063,12 @@ static gboolean dev_property_get_alias(const GDBusPropertyTable *property,
+ 	return TRUE;
+ }
+ 
+-static void set_alias(GDBusPendingPropertySet id, const char *alias,
+-								void *data)
++void btd_device_set_alias(struct btd_device *device, const char *alias)
+ {
+-	struct btd_device *device = data;
+-
+ 	/* No change */
+ 	if ((device->alias == NULL && g_str_equal(alias, "")) ||
+-					g_strcmp0(device->alias, alias) == 0) {
+-		g_dbus_pending_property_success(id);
++					g_strcmp0(device->alias, alias) == 0)
+ 		return;
+-	}
+ 
+ 	g_free(device->alias);
+ 	device->alias = g_str_equal(alias, "") ? NULL : g_strdup(alias);
+@@ -1081,8 +1077,6 @@ static void set_alias(GDBusPendingPropertySet id, const char *alias,
+ 
+ 	g_dbus_emit_property_changed(dbus_conn, device->path,
+ 						DEVICE_INTERFACE, "Alias");
+-
+-	g_dbus_pending_property_success(id);
+ }
+ 
+ static void dev_property_set_alias(const GDBusPropertyTable *property,
+@@ -1100,7 +1094,9 @@ static void dev_property_set_alias(const GDBusPropertyTable *property,
+ 
+ 	dbus_message_iter_get_basic(value, &alias);
+ 
+-	set_alias(id, alias, data);
++	btd_device_set_alias(data, alias);
++
++	g_dbus_pending_property_success(id);
+ }
+ 
+ static gboolean dev_property_exists_class(const GDBusPropertyTable *property,
+@@ -6302,7 +6298,8 @@ static void gatt_client_init(struct btd_device *device)
+ 	}
+ 
+ 	device->client = bt_gatt_client_new(device->db, device->att,
+-						device->att_mtu, features);
++						device->att_mtu, features,
++						device->skip_secondary);
+ 	if (!device->client) {
+ 		DBG("Failed to initialize");
+ 		return;
+@@ -8254,6 +8251,11 @@ void btd_device_set_conn_param(struct btd_device *device, uint16_t min_interval,
+ 					timeout);
+ }
+ 
++void btd_device_set_skip_secondary(struct btd_device *device, bool skip)
++{
++	device->skip_secondary = skip;
++}
++
+ void btd_device_foreach_service_data(struct btd_device *dev, bt_ad_func_t func,
+ 							void *data)
+ {
+diff --git a/src/device.h b/src/device.h
+index c7b8b2a16..8c56d416f 100644
+--- a/src/device.h
++++ b/src/device.h
+@@ -22,6 +22,7 @@ char *btd_device_get_storage_path(struct btd_device *device,
+ 
+ 
+ void btd_device_device_set_name(struct btd_device *device, const char *name);
++void btd_device_set_alias(struct btd_device *device, const char *alias);
+ void device_store_cached_name(struct btd_device *dev, const char *name);
+ void device_get_name(struct btd_device *device, char *name, size_t len);
+ bool device_name_known(struct btd_device *device);
+@@ -231,6 +232,7 @@ void btd_device_foreach_ad(struct btd_device *dev, bt_device_ad_func_t func,
+ void btd_device_set_conn_param(struct btd_device *device, uint16_t min_interval,
+ 					uint16_t max_interval, uint16_t latency,
+ 					uint16_t timeout);
++void btd_device_set_skip_secondary(struct btd_device *device, bool skip);
+ void btd_device_foreach_service_data(struct btd_device *dev,
+ 					bt_device_ad_func_t func,
+ 					void *data);
+diff --git a/src/shared/gatt-client.c b/src/shared/gatt-client.c
+index df1541b88..3e1c3e525 100644
+--- a/src/shared/gatt-client.c
++++ b/src/shared/gatt-client.c
+@@ -20,6 +20,7 @@
+ #include "src/shared/queue.h"
+ #include "src/shared/gatt-db.h"
+ #include "src/shared/gatt-client.h"
++#include "src/shared/timeout.h"
+ 
+ #include <assert.h>
+ #include <limits.h>
+@@ -33,6 +34,8 @@
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+ #endif
+ 
++#define SECONDARY_DISC_TIMEOUT	2000	/* 2 seconds in ms */
++
+ #define UUID_BYTES (BT_GATT_UUID_SIZE * sizeof(uint8_t))
+ 
+ #define GATT_SVC_UUID	0x1801
+@@ -93,6 +96,7 @@ struct bt_gatt_client {
+ 	struct queue *notify_chrcs;
+ 	int next_reg_id;
+ 	unsigned int disc_id, nfy_id, nfy_mult_id, ind_id;
++	bool skip_secondary;
+ 
+ 	/*
+ 	 * Handles of the GATT Service and the Service Changed characteristic
+@@ -113,6 +117,7 @@ struct bt_gatt_client {
+ 	unsigned int next_request_id;
+ 
+ 	struct bt_gatt_request *discovery_req;
++	unsigned int sec_disc_timeout_id;
+ 	unsigned int mtu_req_id;
+ 
+ 	/* Pending retry operation for DB out of sync handling */
+@@ -1230,6 +1235,42 @@ static bool discovery_parse_services(struct discovery_op *op, bool primary,
+ 	return true;
+ }
+ 
++struct sec_disc_timeout_data {
++	struct bt_gatt_client *client;
++	struct discovery_op *op;
++};
++
++static bool sec_disc_timeout_cb(void *user_data)
++{
++	struct sec_disc_timeout_data *data = user_data;
++	struct bt_gatt_client *client = data->client;
++	struct discovery_op *op = data->op;
++
++	DBG(client, "Secondary service discovery timed out, proceeding");
++
++	client->sec_disc_timeout_id = 0;
++
++	/* Cancel the pending ATT request before it hits the 30s ATT timeout */
++	if (client->discovery_req) {
++		bt_gatt_request_cancel(client->discovery_req);
++		bt_gatt_request_unref(client->discovery_req);
++		client->discovery_req = NULL;
++	}
++
++	/* Treat as success — no secondary services found */
++	discovery_op_complete(op, true, 0);
++
++	return false;
++}
++
++static void sec_disc_timeout_destroy(void *user_data)
++{
++	struct sec_disc_timeout_data *data = user_data;
++
++	discovery_op_unref(data->op);
++	free(data);
++}
++
+ static void discover_secondary_cb(bool success, uint8_t att_ecode,
+ 						struct bt_gatt_result *result,
+ 						void *user_data)
+@@ -1241,6 +1282,11 @@ static void discover_secondary_cb(bool success, uint8_t att_ecode,
+ 
+ 	discovery_req_clear(client);
+ 
++	if (client->sec_disc_timeout_id) {
++		timeout_remove(client->sec_disc_timeout_id);
++		client->sec_disc_timeout_id = 0;
++	}
++
+ 	if (!success) {
+ 		switch (att_ecode) {
+ 		case BT_ATT_ERROR_ATTRIBUTE_NOT_FOUND:
+@@ -1344,7 +1390,7 @@ secondary:
+ 	 * functionality of a device and is referenced from at least one
+ 	 * primary service on the device.
+ 	 */
+-	if (queue_isempty(op->pending_svcs))
++	if (queue_isempty(op->pending_svcs) || client->skip_secondary)
+ 		goto done;
+ 
+ 	/* Discover secondary services */
+@@ -1353,8 +1399,18 @@ secondary:
+ 						discover_secondary_cb,
+ 						discovery_op_ref(op),
+ 						discovery_op_unref);
+-	if (client->discovery_req)
++	if (client->discovery_req) {
++		struct sec_disc_timeout_data *td;
++
++		td = new0(struct sec_disc_timeout_data, 1);
++		td->client = client;
++		td->op = discovery_op_ref(op);
++		client->sec_disc_timeout_id = timeout_add(
++						SECONDARY_DISC_TIMEOUT,
++						sec_disc_timeout_cb, td,
++						sec_disc_timeout_destroy);
+ 		return;
++	}
+ 
+ 	DBG(client, "Failed to start secondary service discovery");
+ 
+@@ -2550,7 +2606,8 @@ fail:
+ struct bt_gatt_client *bt_gatt_client_new(struct gatt_db *db,
+ 							struct bt_att *att,
+ 							uint16_t mtu,
+-							uint8_t features)
++							uint8_t features,
++							bool skip_secondary)
+ {
+ 	struct bt_gatt_client *client;
+ 
+@@ -2561,6 +2618,8 @@ struct bt_gatt_client *bt_gatt_client_new(struct gatt_db *db,
+ 	if (!client)
+ 		return NULL;
+ 
++	client->skip_secondary = skip_secondary;
++
+ 	if (!gatt_client_init(client, mtu)) {
+ 		bt_gatt_client_free(client);
+ 		return NULL;
+@@ -2818,6 +2877,11 @@ bool bt_gatt_client_cancel_all(struct bt_gatt_client *client)
+ 
+ 	queue_remove_all(client->pending_requests, NULL, NULL, cancel_pending);
+ 
++	if (client->sec_disc_timeout_id) {
++		timeout_remove(client->sec_disc_timeout_id);
++		client->sec_disc_timeout_id = 0;
++	}
++
+ 	if (client->discovery_req) {
+ 		bt_gatt_request_cancel(client->discovery_req);
+ 		bt_gatt_request_unref(client->discovery_req);
+diff --git a/src/shared/gatt-client.h b/src/shared/gatt-client.h
+index 63cf99500..d9655e6f0 100644
+--- a/src/shared/gatt-client.h
++++ b/src/shared/gatt-client.h
+@@ -19,7 +19,8 @@ struct bt_gatt_client;
+ struct bt_gatt_client *bt_gatt_client_new(struct gatt_db *db,
+ 							struct bt_att *att,
+ 							uint16_t mtu,
+-							uint8_t features);
++							uint8_t features,
++							bool skip_secondary);
+ struct bt_gatt_client *bt_gatt_client_clone(struct bt_gatt_client *client);
+ 
+ struct bt_gatt_client *bt_gatt_client_ref(struct bt_gatt_client *client);
+diff --git a/tools/btgatt-client.c b/tools/btgatt-client.c
+index 667b3d651..58999011a 100644
+--- a/tools/btgatt-client.c
++++ b/tools/btgatt-client.c
+@@ -206,7 +206,7 @@ static struct client *client_create(int fd, uint16_t mtu)
+ 		return NULL;
+ 	}
+ 
+-	cli->gatt = bt_gatt_client_new(cli->db, cli->att, mtu, 0);
++	cli->gatt = bt_gatt_client_new(cli->db, cli->att, mtu, 0, false);
+ 	if (!cli->gatt) {
+ 		fprintf(stderr, "Failed to create GATT client\n");
+ 		gatt_db_unref(cli->db);
+diff --git a/unit/test-bap.c b/unit/test-bap.c
+index 3a67e7016..221bbedfb 100644
+--- a/unit/test-bap.c
++++ b/unit/test-bap.c
+@@ -582,7 +582,7 @@ static void test_setup(const void *user_data)
+ 	db = gatt_db_new();
+ 	g_assert(db);
+ 
+-	data->client = bt_gatt_client_new(db, att, 64, 0);
++	data->client = bt_gatt_client_new(db, att, 64, 0, false);
+ 	g_assert(data->client);
+ 
+ 	bt_gatt_client_set_debug(data->client, print_debug, "bt_gatt_client:",
+diff --git a/unit/test-gatt.c b/unit/test-gatt.c
+index 535baafc6..8780cc4f5 100644
+--- a/unit/test-gatt.c
++++ b/unit/test-gatt.c
+@@ -684,7 +684,7 @@ static struct context *create_context(uint16_t mtu, gconstpointer data)
+ 		g_assert(context->client_db);
+ 
+ 		context->client = bt_gatt_client_new(context->client_db,
+-							context->att, mtu, 0);
++						context->att, mtu, 0, false);
+ 		g_assert(context->client);
+ 
+ 		bt_gatt_client_set_debug(context->client, print_debug,
+diff --git a/unit/test-gmap.c b/unit/test-gmap.c
+index 8b37efd18..fbf1529a6 100644
+--- a/unit/test-gmap.c
++++ b/unit/test-gmap.c
+@@ -323,7 +323,7 @@ static void test_setup(const void *user_data)
+ 	db = gatt_db_new();
+ 	g_assert(db);
+ 
+-	data->client = bt_gatt_client_new(db, att, 64, 0);
++	data->client = bt_gatt_client_new(db, att, 64, 0, false);
+ 	g_assert(data->client);
+ 
+ 	bt_gatt_client_set_debug(data->client, print_debug, "bt_gatt_client:",
+diff --git a/unit/test-mcp.c b/unit/test-mcp.c
+index 7d922bb83..3c5cdaad3 100644
+--- a/unit/test-mcp.c
++++ b/unit/test-mcp.c
+@@ -509,7 +509,7 @@ static void test_setup(const void *user_data)
+ 	db = gatt_db_new();
+ 	g_assert(db);
+ 
+-	data->client = bt_gatt_client_new(db, att, 64, 0);
++	data->client = bt_gatt_client_new(db, att, 64, 0, false);
+ 	g_assert(data->client);
+ 
+ 	bt_gatt_client_set_debug(data->client, print_debug, "bt_gatt_client:",
+diff --git a/unit/test-micp.c b/unit/test-micp.c
+index ff17300d5..64a248a40 100644
+--- a/unit/test-micp.c
++++ b/unit/test-micp.c
+@@ -500,7 +500,8 @@ static void test_setup(const void *user_data)
+ 	db = gatt_db_new();
+ 	g_assert(db);
+ 
+-	data->client = bt_gatt_client_new(db, att, MICP_GATT_CLIENT_MTU, 0);
++	data->client = bt_gatt_client_new(db, att, MICP_GATT_CLIENT_MTU, 0,
++								false);
+ 	g_assert(data->client);
+ 
+ 	bt_gatt_client_set_debug(data->client, print_debug, "bt_gatt_client:",
+diff --git a/unit/test-tmap.c b/unit/test-tmap.c
+index e75d62119..44465abf5 100644
+--- a/unit/test-tmap.c
++++ b/unit/test-tmap.c
+@@ -288,7 +288,7 @@ static void test_setup(const void *user_data)
+ 	db = gatt_db_new();
+ 	g_assert(db);
+ 
+-	data->client = bt_gatt_client_new(db, att, 64, 0);
++	data->client = bt_gatt_client_new(db, att, 64, 0, false);
+ 	g_assert(data->client);
+ 
+ 	bt_gatt_client_set_debug(data->client, print_debug, "bt_gatt_client:",

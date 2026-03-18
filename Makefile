@@ -23,4 +23,4 @@ clean:
 	$(MAKE) -C /lib/modules/$(KVERSION)/build M=$(PWD) $(LLVM_FLAG) clean
 
 dkms:
-	sudo cp -t /usr/src/hid-switch2-1.0 switch2-usb.c Makefile hid-switch2.h hid-switch2.c hid-ids.h dkms.conf 99-switch2-controllers.rules
+	sudo cp -t /usr/src/hid-switch2-1.0 switch2-usb.c switch2-ble.c Makefile hid-switch2.h hid-switch2.c hid-ids.h dkms.conf 99-switch2-controllers.rules

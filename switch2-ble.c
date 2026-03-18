@@ -111,7 +111,7 @@ static int switch2_ble_send_rumble(const uint8_t *buf, size_t len,
 	if (len < 64)
 		return -EINVAL;
 
-	/* GC uses ERM — not implemented for BLE */
+	/* GC may use ERM — not implemented for BLE yet */
 	if (buf[0] == 3)
 		return 0;
 
@@ -289,9 +289,9 @@ static int switch2_ble_probe(struct hid_device *hdev,
 	}
 
 	ns2 = switch2_get_controller(phys);
-	if (!ns2) {
+	if (IS_ERR(ns2)) {
 		hid_err(hdev, "get_controller failed\n");
-		ret = -ENOMEM;
+		ret = PTR_ERR(ns2);
 		goto err_close;
 	}
 
@@ -400,14 +400,15 @@ static void switch2_ble_remove(struct hid_device *hdev)
 /* ------------------------------------------------------------------ */
 
 static const struct hid_device_id switch2_ble_devices[] = {
-	/* uhid devices created by BlueZ gatt-uhid bridge for BLE connections.
-	 * GameCube (0x2073) is wired-only and intentionally omitted. */
+	/* uhid devices created by BlueZ gatt-uhid bridge for BLE connections */
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
 			       USB_DEVICE_ID_NINTENDO_NS2_JOYCONL) },
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
 			       USB_DEVICE_ID_NINTENDO_NS2_JOYCONR) },
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
 			       USB_DEVICE_ID_NINTENDO_NS2_PROCON) },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
+			       USB_DEVICE_ID_NINTENDO_NS2_GCCON) },
 	{}
 };
 MODULE_DEVICE_TABLE(hid, switch2_ble_devices);

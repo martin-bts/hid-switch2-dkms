@@ -143,7 +143,7 @@ enum switch2_init_step {
 
 struct switch2_cmd_header {
 	uint8_t command;
-	uint8_t direciton;
+	uint8_t direction;
 	uint8_t transport;
 	uint8_t subcommand;
 	uint8_t unk1;
@@ -170,8 +170,7 @@ struct switch2_cfg_intf {
 	 *   buf[0x11]    0x50 | seq (right header, PRO only)
 	 *   buf[0x12..0x16]  5-byte HD-rumble encoding (PRO right channel)
 	 * USB: forward the buffer as-is to the HID interrupt-OUT endpoint.
-	 * BLE: extract the 5-byte left-channel payload, wrap in a 0x91
-	 *      NS2_CMD_VIBRATE/subcmd=0x02 frame, send to GATT 0x0014.
+	 * BLE: forward the buffer as-is to GATT haptic handle 0x0012.
 	 */
 	int (*send_rumble)(const uint8_t *buf, size_t len,
 		struct switch2_cfg_intf *intf);
@@ -241,14 +240,6 @@ struct switch2_controller {
 
 	uint32_t player_id;
 
-	/*
-	 * Set by the BLE transport (switch2-ble.c) to indicate that the
-	 * plugin has already inverted the Y axes (4095 - y) before packing
-	 * them into the uhid payload.  When true, switch2_report_stick must
-	 * NOT negate Y a second time.
-	 */
-	bool y_pre_inverted;
-
 #ifdef CONFIG_SWITCH2_FF
 	spinlock_t rumble_lock;
 	uint8_t rumble_seq;
@@ -271,7 +262,7 @@ int switch2_init_controller(struct switch2_controller *controller);
 int switch2_init_input(struct switch2_controller *ns2);
 int switch2_event(struct hid_device *hdev, struct hid_report *report,
 	uint8_t *raw_data, int size);
-int  switch2_alloc_player_id(void);
+int switch2_alloc_player_id(void);
 void switch2_free_player_id(unsigned int id);
 #ifdef CONFIG_SWITCH2_FF
 void switch2_init_rumble(struct switch2_controller *ns2);
