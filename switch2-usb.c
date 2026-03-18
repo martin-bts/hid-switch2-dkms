@@ -119,6 +119,15 @@ static void switch2_bulk_out(struct urb *urb)
 	}
 }
 
+static int switch2_usb_send_rumble(const uint8_t *buf, size_t len,
+	struct switch2_cfg_intf *cfg)
+{
+	struct switch2_usb *ns2_usb = (struct switch2_usb *)cfg;
+
+	return hid_hw_output_report(ns2_usb->cfg.parent->hdev,
+		(uint8_t *)buf, len);
+}
+
 static int switch2_usb_send_cmd(enum switch2_cmd command, uint8_t subcommand,
 	const void *message, size_t size, struct switch2_cfg_intf *cfg)
 {
@@ -266,6 +275,7 @@ static int switch2_usb_probe(struct usb_interface *intf, const struct usb_device
 
 	ns2_usb->cfg.parent = ns2;
 	ns2_usb->cfg.send_command = switch2_usb_send_cmd;
+	ns2_usb->cfg.send_rumble  = switch2_usb_send_rumble;
 
 	init_usb_anchor(&ns2_usb->bulk_out_anchor);
 	spin_lock_init(&ns2_usb->bulk_out_lock);

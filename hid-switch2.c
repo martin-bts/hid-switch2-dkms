@@ -197,6 +197,18 @@ static const uint8_t switch2_feature_mask[] = {
 
 static DEFINE_IDA(switch2_player_id_allocator);
 
+int switch2_alloc_player_id(void)
+{
+	return ida_alloc(&switch2_player_id_allocator, GFP_KERNEL);
+}
+EXPORT_SYMBOL_GPL(switch2_alloc_player_id);
+
+void switch2_free_player_id(unsigned int id)
+{
+	ida_free(&switch2_player_id_allocator, id);
+}
+EXPORT_SYMBOL_GPL(switch2_free_player_id);
+
 #ifdef CONFIG_SWITCH2_FF
 static void switch2_encode_rumble(struct switch2_hd_rumble *rumble, uint8_t buffer[5])
 {
@@ -293,13 +305,24 @@ static void switch2_rumble_work(struct work_struct *work)
 		cancel_delayed_work(&ns2->rumble_work);
 		ret = -ENODEV;
 	} else {
-		ret = hid_hw_output_report(ns2->hdev, buffer, 64);
+		ret = ns2->cfg->send_rumble(buffer, 64, ns2->cfg);
 	}
 
 	kfree(buffer);
 	if (ret < 0)
 		hid_dbg(ns2->hdev, "Failed to send output report ret=%d\n", ret);
 }
+
+void switch2_init_rumble(struct switch2_controller *ns2)
+{
+	if (ns2->ctlr_type != NS2_CTLR_TYPE_GC) {
+		ns2->rumble.hd.hi_freq = RUMBLE_HI_FREQ;
+		ns2->rumble.hd.lo_freq = RUMBLE_LO_FREQ;
+	}
+	spin_lock_init(&ns2->rumble_lock);
+	INIT_DELAYED_WORK(&ns2->rumble_work, switch2_rumble_work);
+}
+EXPORT_SYMBOL_GPL(switch2_init_rumble);
 #endif
 
 struct switch2_controller *switch2_get_controller(const char *phys)
@@ -576,7 +599,7 @@ static void switch2_config_buttons(struct input_dev *idev,
 		input_set_capability(idev, EV_KEY, button->code);
 }
 
-static int switch2_init_input(struct switch2_controller *ns2)
+int switch2_init_input(struct switch2_controller *ns2)
 {
 	struct input_dev *input;
 	struct hid_device *hdev = ns2->hdev;
@@ -661,6 +684,7 @@ static int switch2_init_input(struct switch2_controller *ns2)
 			ns2->version.dsp_minor, ns2->version.dsp_patch);
 	return input_register_device(input);
 }
+EXPORT_SYMBOL_GPL(switch2_init_input);
 
 int switch2_init_controller(struct switch2_controller *ns2)
 {
@@ -771,10 +795,10 @@ static void switch2_report_axis(struct input_dev *input, struct switch2_axis_cal
 }
 
 static void switch2_report_stick(struct input_dev *input, struct switch2_stick_calibration *calib,
-	int x, int y, const uint8_t *data)
+	int x, int y, const uint8_t *data, bool negate_y)
 {
 	switch2_report_axis(input, &calib->x, x, data[0] | ((data[1] & 0x0F) << 8), false);
-	switch2_report_axis(input, &calib->y, y, (data[1] >> 4) | (data[2] << 4), true);
+	switch2_report_axis(input, &calib->y, y, (data[1] >> 4) | (data[2] << 4), negate_y);
 }
 
 static void switch2_report_trigger(struct input_dev *input, uint8_t zero, int abs, uint8_t data)
@@ -784,7 +808,7 @@ static void switch2_report_trigger(struct input_dev *input, uint8_t zero, int ab
 	input_report_abs(input, abs, clamp(value, 0, NS2_TRIGGER_RANGE));
 }
 
-static int switch2_event(struct hid_device *hdev, struct hid_report *report, uint8_t *raw_data,
+int switch2_event(struct hid_device *hdev, struct hid_report *report, uint8_t *raw_data,
 	int size)
 {
 	struct switch2_controller *ns2 = hid_get_drvdata(hdev);
@@ -818,11 +842,13 @@ static int switch2_event(struct hid_device *hdev, struct hid_report *report, uin
 		input_report_abs(input, ABS_HAT0Y,
 			!!(raw_data[3] & NS2_BTNL_DOWN) -
 			!!(raw_data[3] & NS2_BTNL_UP));
-		switch2_report_stick(input, &ns2->stick_calib[0], ABS_X, ABS_Y, &raw_data[6]);
+		switch2_report_stick(input, &ns2->stick_calib[0], ABS_X, ABS_Y, &raw_data[6],
+			!ns2->y_pre_inverted);
 		switch2_report_buttons(input, &raw_data[3], left_joycon_button_mappings);
 		break;
 	case NS2_REPORT_JCR:
-		switch2_report_stick(input, &ns2->stick_calib[0], ABS_RX, ABS_RY, &raw_data[6]);
+		switch2_report_stick(input, &ns2->stick_calib[0], ABS_RX, ABS_RY, &raw_data[6],
+			!ns2->y_pre_inverted);
 		switch2_report_buttons(input, &raw_data[3], right_joycon_button_mappings);
 		break;
 	case NS2_REPORT_GC:
@@ -833,8 +859,10 @@ static int switch2_event(struct hid_device *hdev, struct hid_report *report, uin
 			!!(raw_data[4] & NS2_BTNL_DOWN) -
 			!!(raw_data[4] & NS2_BTNL_UP));
 		switch2_report_buttons(input, &raw_data[3], gccon_mappings);
-		switch2_report_stick(input, &ns2->stick_calib[0], ABS_X, ABS_Y, &raw_data[6]);
-		switch2_report_stick(input, &ns2->stick_calib[1], ABS_RX, ABS_RY, &raw_data[9]);
+		switch2_report_stick(input, &ns2->stick_calib[0], ABS_X, ABS_Y, &raw_data[6],
+			!ns2->y_pre_inverted);
+		switch2_report_stick(input, &ns2->stick_calib[1], ABS_RX, ABS_RY, &raw_data[9],
+			!ns2->y_pre_inverted);
 		switch2_report_trigger(input, ns2->lt_zero, ABS_Z, raw_data[13]);
 		switch2_report_trigger(input, ns2->rt_zero, ABS_RZ, raw_data[14]);
 		break;
@@ -846,8 +874,10 @@ static int switch2_event(struct hid_device *hdev, struct hid_report *report, uin
 			!!(raw_data[4] & NS2_BTNL_DOWN) -
 			!!(raw_data[4] & NS2_BTNL_UP));
 		switch2_report_buttons(input, &raw_data[3], procon_mappings);
-		switch2_report_stick(input, &ns2->stick_calib[0], ABS_X, ABS_Y, &raw_data[6]);
-		switch2_report_stick(input, &ns2->stick_calib[1], ABS_RX, ABS_RY, &raw_data[9]);
+		switch2_report_stick(input, &ns2->stick_calib[0], ABS_X, ABS_Y, &raw_data[6],
+			!ns2->y_pre_inverted);
+		switch2_report_stick(input, &ns2->stick_calib[1], ABS_RX, ABS_RY, &raw_data[9],
+			!ns2->y_pre_inverted);
 		break;
 	default:
 		return -EINVAL;
@@ -856,20 +886,22 @@ static int switch2_event(struct hid_device *hdev, struct hid_report *report, uin
 	input_sync(input);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(switch2_event);
 
 static int switch2_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
 	struct switch2_controller *ns2;
-	struct usb_device *udev;
+	struct usb_device *udev = NULL;
 	char phys[64];
 	int ret;
 
-	if (!hid_is_usb(hdev))
+	if (hid_is_usb(hdev)) {
+		udev = hid_to_usb_dev(hdev);
+		if (usb_make_path(udev, phys, sizeof(phys)) < 0)
+			return -EINVAL;
+	} else {
 		return -ENODEV;
-
-	udev = hid_to_usb_dev(hdev);
-	if (usb_make_path(udev, phys, sizeof(phys)) < 0)
-		return -EINVAL;
+	}
 
 	ret = hid_parse(hdev);
 	if (ret) {
@@ -904,13 +936,9 @@ static int switch2_probe(struct hid_device *hdev, const struct hid_device_id *id
 		hid_warn(hdev, "Failed to allocate player ID, skipping; ret=%d\n", ret);
 	else
 		ns2->player_id = ret;
+
 #ifdef CONFIG_SWITCH2_FF
-	if (ns2->ctlr_type != NS2_CTLR_TYPE_GC) {
-		ns2->rumble.hd.hi_freq = RUMBLE_HI_FREQ;
-		ns2->rumble.hd.lo_freq = RUMBLE_LO_FREQ;
-	}
-	spin_lock_init(&ns2->rumble_lock);
-	INIT_DELAYED_WORK(&ns2->rumble_work, switch2_rumble_work);
+	switch2_init_rumble(ns2);
 #endif
 	hid_set_drvdata(hdev, ns2);
 

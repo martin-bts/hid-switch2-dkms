@@ -159,6 +159,31 @@ struct switch2_cfg_intf {
 	int (*send_command)(enum switch2_cmd command, uint8_t subcommand,
 		const void *message, size_t length,
 		struct switch2_cfg_intf *intf);
+
+	/*
+	 * send_rumble: transport-specific haptic output.
+	 * @buf: 64-byte rumble buffer as built by switch2_rumble_work.
+	 *   buf[0]       controller type: 1=JC (single-LRA), 2=PRO (dual-LRA),
+	 *                                 3=GC (ERM)
+	 *   buf[0x01]    0x50 | seq (left/single header)
+	 *   buf[0x02..0x06]  5-byte HD-rumble encoding (JC/PRO left channel)
+	 *   buf[0x11]    0x50 | seq (right header, PRO only)
+	 *   buf[0x12..0x16]  5-byte HD-rumble encoding (PRO right channel)
+	 * USB: forward the buffer as-is to the HID interrupt-OUT endpoint.
+	 * BLE: extract the 5-byte left-channel payload, wrap in a 0x91
+	 *      NS2_CMD_VIBRATE/subcmd=0x02 frame, send to GATT 0x0014.
+	 */
+	int (*send_rumble)(const uint8_t *buf, size_t len,
+		struct switch2_cfg_intf *intf);
+};
+
+/*
+ * BLE transport — per-device cfg allocated in switch2_probe().
+ * Embeds switch2_cfg_intf as its first member so (struct switch2_cfg_intf *)
+ * casts work correctly (same layout trick as struct switch2_usb).
+ */
+struct switch2_ble {
+	struct switch2_cfg_intf cfg;	/* must be first */
 };
 
 struct switch2_version_info {
@@ -216,6 +241,14 @@ struct switch2_controller {
 
 	uint32_t player_id;
 
+	/*
+	 * Set by the BLE transport (switch2-ble.c) to indicate that the
+	 * plugin has already inverted the Y axes (4095 - y) before packing
+	 * them into the uhid payload.  When true, switch2_report_stick must
+	 * NOT negate Y a second time.
+	 */
+	bool y_pre_inverted;
+
 #ifdef CONFIG_SWITCH2_FF
 	spinlock_t rumble_lock;
 	uint8_t rumble_seq;
@@ -235,6 +268,14 @@ int switch2_receive_command(struct switch2_controller *controller,
 	const uint8_t *message, size_t length);
 
 int switch2_init_controller(struct switch2_controller *controller);
+int switch2_init_input(struct switch2_controller *ns2);
+int switch2_event(struct hid_device *hdev, struct hid_report *report,
+	uint8_t *raw_data, int size);
+int  switch2_alloc_player_id(void);
+void switch2_free_player_id(unsigned int id);
+#ifdef CONFIG_SWITCH2_FF
+void switch2_init_rumble(struct switch2_controller *ns2);
+#endif
 
 static inline bool switch2_ctlr_is_joycon(enum switch2_ctlr_type type)
 {

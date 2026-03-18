@@ -1,5 +1,6 @@
 obj-m += hid-switch2.o
 obj-m += switch2-usb.o
+obj-m += switch2-ble.o
 
 # Enable Force Feedback support as defined in the patch's Kconfig
 ccflags-y += -DCONFIG_SWITCH2_FF
@@ -20,3 +21,6 @@ all:
 
 clean:
 	$(MAKE) -C /lib/modules/$(KVERSION)/build M=$(PWD) $(LLVM_FLAG) clean
+
+dkms:
+	sudo cp -t /usr/src/hid-switch2-1.0 switch2-usb.c Makefile hid-switch2.h hid-switch2.c hid-ids.h dkms.conf 99-switch2-controllers.rules
