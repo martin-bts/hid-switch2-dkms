@@ -41,6 +41,10 @@
  * This is a property of the controller's GATT service layout. */
 #define NS2_GATT_CMD_HANDLE	0x0014
 
+/* GATT handle for the haptic data characteristic.
+ * Raw 64-byte HD-rumble frames are written here — no 0x91 wrapping. */
+#define NS2_GATT_HAPTIC_HANDLE	0x0012
+
 /*
  * Extended per-BLE-connection state.  Wraps the upstream switch2_ble
  * (which contains cfg as its first member) with GATT handle routing.
@@ -89,10 +93,8 @@ static int switch2_ble_send_cmd(enum switch2_cmd command, uint8_t subcommand,
 		memcpy(frame + GATT_HANDLE_SIZE + sizeof(header), msg, len);
 
 	ret = hid_hw_output_report(ns2->hdev, frame, frame_len);
-	hid_info(ns2->hdev, "DBG send_cmd: cmd=0x%02x sub=0x%02x len=%zu ret=%d\n",
+	hid_dbg(ns2->hdev, "send_cmd: cmd=0x%02x sub=0x%02x len=%zu ret=%d\n",
 		command, subcommand, frame_len, ret);
-	print_hex_dump(KERN_INFO, "DBG send_cmd frame: ", DUMP_PREFIX_NONE,
-		16, 1, frame, min(frame_len, (size_t)32), false);
 	kfree(frame);
 	return ret;
 }
@@ -101,28 +103,26 @@ static int switch2_ble_send_rumble(const uint8_t *buf, size_t len,
 	struct switch2_cfg_intf *intf)
 {
 	struct switch2_controller *ns2 = intf->parent;
-	struct switch2_cmd_header header = {
-		NS2_CMD_VIBRATE, NS2_DIR_OUT | NS2_FLAG_OK, NS2_TRANS_BT,
-		0x02, 0, 5
-	};
-	uint8_t frame[GATT_HANDLE_SIZE + sizeof(header) + 5];
+	uint8_t frame[GATT_HANDLE_SIZE + 64];
 
 	if (!ns2->hdev)
 		return -ENODEV;
 
-	if (len < 7)
+	if (len < 64)
 		return -EINVAL;
 
 	/* GC uses ERM — not implemented for BLE */
 	if (buf[0] == 3)
 		return 0;
 
-	/* Little-endian GATT handle prefix */
-	frame[0] = NS2_GATT_CMD_HANDLE & 0xff;
-	frame[1] = (NS2_GATT_CMD_HANDLE >> 8) & 0xff;
+	/* Little-endian GATT handle prefix — haptic data goes to 0x0012 */
+	frame[0] = NS2_GATT_HAPTIC_HANDLE & 0xff;
+	frame[1] = (NS2_GATT_HAPTIC_HANDLE >> 8) & 0xff;
 
-	memcpy(frame + GATT_HANDLE_SIZE, &header, sizeof(header));
-	memcpy(frame + GATT_HANDLE_SIZE + sizeof(header), &buf[0x02], 5);
+	/* Send the raw 64-byte haptic buffer as-is (no 0x91 wrapping).
+	 * The buffer already contains the 0x50|seq header, L/R channels,
+	 * and HD-rumble encoding — exactly what handle 0x0012 expects. */
+	memcpy(frame + GATT_HANDLE_SIZE, buf, 64);
 
 	return hid_hw_output_report(ns2->hdev, frame, sizeof(frame));
 }
