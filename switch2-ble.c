@@ -143,13 +143,10 @@ static void switch2_ble_init_work(struct work_struct *work)
 		mutex_unlock(&ns2->lock);
 		return;
 	}
-	hid_info(ns2->hdev, "DBG deferred init_controller, init_step=%d\n",
-		ns2->init_step);
 	ret = switch2_init_controller(ns2);
-	hid_info(ns2->hdev, "DBG deferred init_controller returned %d, init_step=%d\n",
-		ret, ns2->init_step);
 	if (ret < 0)
-		hid_err(ns2->hdev, "deferred init_controller failed %d\n", ret);
+		hid_err(ns2->hdev, "deferred init failed: %d (step %d)\n",
+			ret, ns2->init_step);
 	mutex_unlock(&ns2->lock);
 }
 
@@ -173,7 +170,6 @@ static int switch2_ble_raw_event(struct hid_device *hdev,
 	uint8_t *payload;
 	int payload_len;
 	int ret;
-	static unsigned int dbg_count;
 
 	if (report->type != HID_INPUT_REPORT)
 		return 0;
@@ -196,21 +192,10 @@ static int switch2_ble_raw_event(struct hid_device *hdev,
 	payload = raw_data + 1 + GATT_HANDLE_SIZE;
 	payload_len = size - 1 - GATT_HANDLE_SIZE;
 
-	/* Log first few events and then every 256th */
-	if (dbg_count < 10 || (dbg_count % 256) == 0)
-		hid_info(hdev, "DBG raw_event: size=%d handle=0x%04x payload_len=%d "
-			"input_h=0x%04x ack_h=0x%04x init_step=%d count=%u\n",
-			size, handle, payload_len,
-			ns2_ble->input_handle, ns2_ble->ack_handle,
-			ns2->init_step, dbg_count);
-	dbg_count++;
-
 	if (handle == ns2_ble->ack_handle) {
 		/* ACK / command response — route to init state machine */
-		hid_info(hdev, "DBG ACK received: %d bytes, first=%02x\n",
+		hid_dbg(hdev, "ACK: %d bytes, first=%02x\n",
 			payload_len, payload_len > 0 ? payload[0] : 0);
-		print_hex_dump(KERN_INFO, "DBG ACK data: ", DUMP_PREFIX_NONE,
-			16, 1, payload, min(payload_len, 32), false);
 		switch2_receive_command(ns2, payload, payload_len);
 		return 0;
 	}
@@ -229,7 +214,6 @@ static int switch2_ble_raw_event(struct hid_device *hdev,
 		uint8_t buf[64];
 		unsigned int orig_id = report->id;
 		uint8_t report_type;
-		struct input_dev *input;
 
 		switch (ns2->ctlr_type) {
 		case NS2_CTLR_TYPE_JCL:
@@ -252,27 +236,14 @@ static int switch2_ble_raw_event(struct hid_device *hdev,
 		buf[0] = report_type;
 		memcpy(&buf[1], payload, payload_len);
 
-		/* Log first few input events */
-		if (dbg_count < 15) {
-			rcu_read_lock();
-			input = rcu_dereference(ns2->input);
-			rcu_read_unlock();
-			hid_info(hdev, "DBG input: report_type=0x%02x "
-				"payload_len=%d has_input=%d\n",
-				report_type, payload_len, input != NULL);
-			print_hex_dump(KERN_INFO, "DBG input buf: ",
-				DUMP_PREFIX_NONE, 16, 1, buf,
-				min(payload_len + 1, 16), false);
-		}
-
 		report->id = report_type;
 		ret = switch2_event(hdev, report, buf, payload_len + 1);
 		report->id = orig_id;
 		return ret;
 	}
 
-	/* Other handles — log and ignore */
-	hid_info(hdev, "DBG unhandled handle 0x%04x, %d bytes\n", handle,
+	/* Other handles — ignore */
+	hid_dbg(hdev, "unhandled handle 0x%04x, %d bytes\n", handle,
 		payload_len);
 
 	return 0;
@@ -290,7 +261,7 @@ static int switch2_ble_probe(struct hid_device *hdev,
 	char phys[64];
 	int ret;
 
-	hid_info(hdev, "DBG probe start\n");
+	hid_dbg(hdev, "probe start\n");
 
 	snprintf(phys, sizeof(phys), "bt%s", hdev->uniq);
 
@@ -319,7 +290,7 @@ static int switch2_ble_probe(struct hid_device *hdev,
 
 	ns2 = switch2_get_controller(phys);
 	if (!ns2) {
-		hid_err(hdev, "DBG get_controller failed\n");
+		hid_err(hdev, "get_controller failed\n");
 		ret = -ENOMEM;
 		goto err_close;
 	}
@@ -386,7 +357,7 @@ static int switch2_ble_probe(struct hid_device *hdev,
 	hid_set_drvdata(hdev, ns2);
 
 	mutex_unlock(&ns2->lock);
-	hid_info(hdev, "DBG probe complete\n");
+	hid_dbg(hdev, "probe complete\n");
 	return 0;
 
 err_put:
@@ -413,7 +384,7 @@ static void switch2_ble_remove(struct hid_device *hdev)
 	if (ns2_ble)
 		cancel_work_sync(&ns2_ble->init_work);
 
-	hid_info(hdev, "DBG remove\n");
+	hid_dbg(hdev, "remove\n");
 	mutex_lock(&ns2->lock);
 	ns2->hdev  = NULL;
 	ns2->cfg   = NULL;
