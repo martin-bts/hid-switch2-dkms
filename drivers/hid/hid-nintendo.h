@@ -52,7 +52,24 @@ struct switch2_cmd_header {
 };
 static_assert(sizeof(struct switch2_cmd_header) == 8);
 
+enum switch2_ctlr_type {
+	NS2_CTLR_TYPE_JCL = 0x00,
+	NS2_CTLR_TYPE_JCR = 0x01,
+	NS2_CTLR_TYPE_PRO = 0x02,
+	NS2_CTLR_TYPE_GC = 0x03,
+};
+
+enum switch2_report_id {
+	NS2_REPORT_UNIFIED = 0x05,
+	NS2_REPORT_JCL = 0x07,
+	NS2_REPORT_JCR = 0x08,
+	NS2_REPORT_PRO = 0x09,
+	NS2_REPORT_GC = 0x0a,
+};
+
 struct device;
+struct hid_device;
+struct hid_report;
 struct switch2_controller;
 struct switch2_cfg_intf {
 	struct switch2_controller *parent;
@@ -66,7 +83,22 @@ struct switch2_cfg_intf {
 int switch2_controller_attach_cfg(const char *phys, struct switch2_cfg_intf *cfg);
 void switch2_controller_detach_cfg(struct switch2_controller *controller);
 
+struct switch2_controller *switch2_controller_attach_hdev(const char *phys,
+	struct hid_device *hdev);
+void switch2_controller_detach_hdev(struct switch2_controller *ns2);
+
 int switch2_receive_command(struct switch2_controller *controller,
 	const uint8_t *message, size_t length);
+
+int switch2_event(struct hid_device *hdev, struct hid_report *report,
+	uint8_t *raw_data, int size);
+
+enum switch2_ctlr_type switch2_controller_get_type(
+	struct switch2_controller *controller);
+
+struct switch2_cfg_intf *switch2_controller_get_cfg(
+	struct switch2_controller *controller);
+void switch2_controller_set_cfg(struct switch2_controller *controller,
+	struct switch2_cfg_intf *cfg);
 
 #endif

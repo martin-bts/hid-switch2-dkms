@@ -37,6 +37,8 @@
 #include <linux/unaligned.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/completion.h>
+#include <linux/debugfs.h>
 #include <linux/devm-helpers.h>
 #include <linux/kernel.h>
 #include <linux/hid.h>
@@ -2947,20 +2949,7 @@ enum switch2_subcmd_fw_info {
 	NS2_SUBCMD_FW_INFO_GET = 0x1,
 };
 
-enum switch2_ctlr_type {
-	NS2_CTLR_TYPE_JCL = 0x00,
-	NS2_CTLR_TYPE_JCR = 0x01,
-	NS2_CTLR_TYPE_PRO = 0x02,
-	NS2_CTLR_TYPE_GC = 0x03,
-};
-
-enum switch2_report_id {
-	NS2_REPORT_UNIFIED = 0x05,
-	NS2_REPORT_JCL = 0x07,
-	NS2_REPORT_JCR = 0x08,
-	NS2_REPORT_PRO = 0x09,
-	NS2_REPORT_GC = 0x0a,
-};
+/* enum switch2_ctlr_type and enum switch2_report_id are in hid-nintendo.h */
 
 enum switch2_init_step {
 	NS2_INIT_READ_SERIAL,
@@ -3050,6 +3039,16 @@ struct switch2_controller {
 	uint64_t last_rumble_work;
 	struct delayed_work rumble_work;
 	uint8_t *rumble_buffer;
+#endif
+
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+	/* debugfs command interface */
+	struct dentry *debug_cmd;
+	struct dentry *debug_resp;
+	uint8_t debug_resp_buf[72];
+	size_t debug_resp_len;
+	struct completion debug_resp_done;
+	bool debug_cmd_pending;
 #endif
 };
 
@@ -3838,7 +3837,7 @@ static void switch2_report_trigger(struct input_dev *input, uint8_t zero, int ab
 	input_report_abs(input, abs, clamp(value, 0, NS2_TRIGGER_RANGE));
 }
 
-static int switch2_event(struct hid_device *hdev, struct hid_report *report, uint8_t *raw_data,
+int switch2_event(struct hid_device *hdev, struct hid_report *report, uint8_t *raw_data,
 	int size)
 {
 	struct switch2_controller *ns2 = hid_get_drvdata(hdev);
@@ -3949,6 +3948,8 @@ static int switch2_event(struct hid_device *hdev, struct hid_report *report, uin
 	input_sync(input);
 	return 0;
 }
+
+EXPORT_SYMBOL_GPL(switch2_event);
 
 static int switch2_features_enable(struct switch2_controller *ns2, int features)
 {
@@ -4181,6 +4182,16 @@ int switch2_receive_command(struct switch2_controller *ns2,
 	}
 
 exit:
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+	/* Capture response for debugfs if a debug command is pending */
+	if (ns2->debug_cmd_pending) {
+		ns2->debug_resp_len = min(length, sizeof(ns2->debug_resp_buf));
+		memcpy(ns2->debug_resp_buf, message - 8, ns2->debug_resp_len);
+		ns2->debug_cmd_pending = false;
+		complete(&ns2->debug_resp_done);
+	}
+#endif
+
 	if (ns2->init_step < NS2_INIT_DONE)
 		switch2_init_controller(ns2);
 
@@ -4237,38 +4248,152 @@ void switch2_controller_detach_cfg(struct switch2_controller *ns2)
 }
 EXPORT_SYMBOL_GPL(switch2_controller_detach_cfg);
 
-static int switch2_probe(struct hid_device *hdev, const struct hid_device_id *id)
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+/* ------------------------------------------------------------------ */
+/* debugfs: raw command/response interface                              */
+/* ------------------------------------------------------------------ */
+
+static ssize_t switch2_debug_cmd_write(struct file *f, const char __user *user_buf,
+	size_t count, loff_t *ppos)
 {
-	struct switch2_controller *ns2;
-	struct usb_device *udev;
-	char phys[64];
-	int ret;
+	struct switch2_controller *ns2 = file_inode(f)->i_private;
+	char buf[128];
+	uint8_t payload[56];
+	unsigned int cmd, subcmd;
+	size_t payload_len = 0;
+	size_t cnt = min(count, sizeof(buf) - 1);
+	char *p, *token;
+	int i, ret;
 
-	if (!hid_is_usb(hdev))
-		return -ENODEV;
+	if (copy_from_user(buf, user_buf, cnt))
+		return -EFAULT;
+	buf[cnt] = '\0';
 
-	udev = hid_to_usb_dev(hdev);
-	if (usb_make_path(udev, phys, sizeof(phys)) < 0)
+	/* Strip trailing whitespace */
+	while (cnt > 0 && (buf[cnt - 1] == '\n' || buf[cnt - 1] == ' '))
+		buf[--cnt] = '\0';
+
+	/* Parse: "cmd subcmd [payload bytes in hex]" */
+	p = buf;
+	token = strsep(&p, " ");
+	if (!token || kstrtouint(token, 16, &cmd))
 		return -EINVAL;
 
-	ret = hid_parse(hdev);
-	if (ret) {
-		hid_err(hdev, "parse failed %d\n", ret);
+	token = strsep(&p, " ");
+	if (!token || kstrtouint(token, 16, &subcmd))
+		return -EINVAL;
+
+	/* Remaining tokens are optional payload bytes */
+	i = 0;
+	while (p && *p && i < (int)sizeof(payload)) {
+		unsigned int byte;
+
+		token = strsep(&p, " ");
+		if (!token || !*token)
+			continue;
+		if (kstrtouint(token, 16, &byte) || byte > 0xff)
+			return -EINVAL;
+		payload[i++] = byte;
+	}
+	payload_len = i;
+
+	guard(mutex)(&ns2->lock);
+	if (!ns2->cfg)
+		return -ENOTCONN;
+
+	reinit_completion(&ns2->debug_resp_done);
+	ns2->debug_cmd_pending = true;
+
+	ret = ns2->cfg->send_command(cmd, subcmd,
+		payload_len ? payload : NULL, payload_len, ns2->cfg);
+	if (ret < 0) {
+		ns2->debug_cmd_pending = false;
 		return ret;
 	}
 
-	ns2 = switch2_get_controller(phys);
+	return count;
+}
+
+static ssize_t switch2_debug_resp_read(struct file *f, char __user *user_buf,
+	size_t count, loff_t *ppos)
+{
+	struct switch2_controller *ns2 = file_inode(f)->i_private;
+	char hex[256];
+	int i, len;
+	long ret;
+
+	ret = wait_for_completion_interruptible_timeout(&ns2->debug_resp_done,
+		msecs_to_jiffies(2000));
+	if (ret == 0)
+		return -ETIMEDOUT;
+	if (ret < 0)
+		return ret;
+
+	len = 0;
+	for (i = 0; i < ns2->debug_resp_len && len < (int)sizeof(hex) - 4; i++)
+		len += snprintf(hex + len, sizeof(hex) - len, "%02x ",
+				ns2->debug_resp_buf[i]);
+	if (len > 0)
+		hex[len - 1] = '\n'; /* replace trailing space */
+
+	return simple_read_from_buffer(user_buf, count, ppos, hex, len);
+}
+
+static const struct file_operations switch2_debug_cmd_fops = {
+	.owner	= THIS_MODULE,
+	.open	= simple_open,
+	.write	= switch2_debug_cmd_write,
+};
+
+static const struct file_operations switch2_debug_resp_fops = {
+	.owner	= THIS_MODULE,
+	.open	= simple_open,
+	.read	= switch2_debug_resp_read,
+};
+
+static void switch2_debugfs_create(struct switch2_controller *ns2)
+{
+	struct hid_device *hdev = ns2->hdev;
+
+	if (!hdev || !hdev->debug_dir)
+		return;
+
+	init_completion(&ns2->debug_resp_done);
+	ns2->debug_cmd = debugfs_create_file("command", 0200,
+		hdev->debug_dir, ns2, &switch2_debug_cmd_fops);
+	ns2->debug_resp = debugfs_create_file("response", 0400,
+		hdev->debug_dir, ns2, &switch2_debug_resp_fops);
+}
+
+static void switch2_debugfs_remove(struct switch2_controller *ns2)
+{
+	debugfs_remove(ns2->debug_cmd);
+	debugfs_remove(ns2->debug_resp);
+	ns2->debug_cmd = NULL;
+	ns2->debug_resp = NULL;
+}
+#else
+static inline void switch2_debugfs_create(struct switch2_controller *ns2) {}
+static inline void switch2_debugfs_remove(struct switch2_controller *ns2) {}
+#endif /* CONFIG_DEBUG_FS */
+
+struct switch2_controller *switch2_controller_attach_hdev(const char *phys,
+	struct hid_device *hdev)
+{
+	struct switch2_controller *ns2 = switch2_get_controller(phys);
+	int ret;
+
 	if (IS_ERR(ns2))
-		return PTR_ERR(ns2);
+		return ns2;
 
 	mutex_lock(&ns2->lock);
 	if (ns2->hdev) {
-		mutex_unlock(&ns2->lock);
 		hid_err(hdev,
 			"Second hdev tried to claim same controller, first=%p vs second=%p\n",
 			ns2->hdev, hdev);
+		mutex_unlock(&ns2->lock);
 		kref_put(&ns2->refcount, switch2_kref_put);
-		return -EBUSY;
+		return ERR_PTR(-EBUSY);
 	}
 	ns2->hdev = hdev;
 	hid_set_drvdata(hdev, ns2);
@@ -4299,10 +4424,93 @@ static int switch2_probe(struct hid_device *hdev, const struct hid_device_id *id
 	spin_lock_init(&ns2->rumble_lock);
 #endif
 
+	switch2_debugfs_create(ns2);
+
+	ret = 0;
+	if (ns2->cfg)
+		ret = switch2_init_controller(ns2);
+
+	if (!ret) {
+		mutex_unlock(&ns2->lock);
+		return ns2;
+	}
+
+	switch2_debugfs_remove(ns2);
+	if (ns2->player_id != U32_MAX)
+		ida_free(&nintendo_player_id_allocator, ns2->player_id);
+	ns2->hdev = NULL;
+	hid_set_drvdata(hdev, NULL);
+	mutex_unlock(&ns2->lock);
+	switch2_controller_put(ns2);
+	kref_put(&ns2->refcount, switch2_kref_put);
+
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL_GPL(switch2_controller_attach_hdev);
+
+void switch2_controller_detach_hdev(struct switch2_controller *ns2)
+{
+	switch2_debugfs_remove(ns2);
+	switch2_controller_put(ns2);
+
+	mutex_lock(&ns2->lock);
+	WARN_ON(!ns2->hdev);
+	ns2->hdev = NULL;
+	if (ns2->player_id != U32_MAX)
+		ida_free(&nintendo_player_id_allocator, ns2->player_id);
+	ns2->player_id = U32_MAX;
+	mutex_unlock(&ns2->lock);
+
+	kref_put(&ns2->refcount, switch2_kref_put);
+}
+EXPORT_SYMBOL_GPL(switch2_controller_detach_hdev);
+
+enum switch2_ctlr_type switch2_controller_get_type(struct switch2_controller *ns2)
+{
+	return ns2->ctlr_type;
+}
+EXPORT_SYMBOL_GPL(switch2_controller_get_type);
+
+struct switch2_cfg_intf *switch2_controller_get_cfg(struct switch2_controller *ns2)
+{
+	return ns2->cfg;
+}
+EXPORT_SYMBOL_GPL(switch2_controller_get_cfg);
+
+void switch2_controller_set_cfg(struct switch2_controller *ns2,
+	struct switch2_cfg_intf *cfg)
+{
+	guard(mutex)(&ns2->lock);
+	ns2->cfg = cfg;
+	if (cfg)
+		cfg->parent = ns2;
+}
+EXPORT_SYMBOL_GPL(switch2_controller_set_cfg);
+
+static int switch2_probe(struct hid_device *hdev, const struct hid_device_id *id)
+{
+	struct switch2_controller *ns2;
+	struct usb_device *udev;
+	char phys[64];
+	int ret;
+
+	if (!hid_is_usb(hdev))
+		return -ENODEV;
+
+	udev = hid_to_usb_dev(hdev);
+	if (usb_make_path(udev, phys, sizeof(phys)) < 0)
+		return -EINVAL;
+
+	ret = hid_parse(hdev);
+	if (ret) {
+		hid_err(hdev, "parse failed %d\n", ret);
+		return ret;
+	}
+
 	ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
 	if (ret) {
 		hid_err(hdev, "hw_start failed %d\n", ret);
-		goto err_cleanup;
+		return ret;
 	}
 
 	ret = hid_hw_open(hdev);
@@ -4311,24 +4519,18 @@ static int switch2_probe(struct hid_device *hdev, const struct hid_device_id *id
 		goto err_stop;
 	}
 
-	ret = 0;
-	if (ns2->cfg)
-		ret = switch2_init_controller(ns2);
-
-	if (!ret) {
-		mutex_unlock(&ns2->lock);
-		return 0;
+	ns2 = switch2_controller_attach_hdev(phys, hdev);
+	if (IS_ERR(ns2)) {
+		ret = PTR_ERR(ns2);
+		goto err_close;
 	}
 
+	return 0;
+
+err_close:
 	hid_hw_close(hdev);
 err_stop:
 	hid_hw_stop(hdev);
-err_cleanup:
-	ida_free(&nintendo_player_id_allocator, ns2->player_id);
-	ns2->hdev = NULL;
-	mutex_unlock(&ns2->lock);
-	switch2_controller_put(ns2);
-	kref_put(&ns2->refcount, switch2_kref_put);
 
 	return ret;
 }
@@ -4337,13 +4539,8 @@ static void switch2_remove(struct hid_device *hdev)
 {
 	struct switch2_controller *ns2 = hid_get_drvdata(hdev);
 
-	switch2_controller_put(ns2);
-	mutex_lock(&ns2->lock);
-	ns2->hdev = NULL;
-	ida_free(&nintendo_player_id_allocator, ns2->player_id);
-	mutex_unlock(&ns2->lock);
-	kref_put(&ns2->refcount, switch2_kref_put);
 	hid_hw_close(hdev);
+	switch2_controller_detach_hdev(ns2);
 	hid_hw_stop(hdev);
 }
 
