@@ -1,15 +1,18 @@
-obj-m += hid-switch2.o
-obj-m += switch2-usb.o
-obj-m += switch2-ble.o
+obj-m += drivers/hid/
+obj-m += drivers/input/joystick/
 
-# Enable Force Feedback support as defined in the patch's Kconfig
-ccflags-y += -DCONFIG_SWITCH2_FF
+# Enable Force Feedback support
+ccflags-y += -DCONFIG_NINTENDO_FF
 
+# Resolve private kernel headers (usbhid/usbhid.h) from the kernel build
+# tree when they are not overridden by local copies.
 KVERSION ?= $(shell uname -r)
+KBUILD := /lib/modules/$(KVERSION)/build
+ccflags-y += -I$(KBUILD)/drivers/hid
 
 # Auto-detect if the kernel was built with the full LLVM toolchain (e.g. CachyOS)
-KERNEL_CC := $(shell sed -n 's/^CONFIG_CC_IS_CLANG=y/clang/p' /lib/modules/$(KVERSION)/build/.config 2>/dev/null)
-KERNEL_LD := $(shell sed -n 's/^CONFIG_LD_IS_LLD=y/lld/p' /lib/modules/$(KVERSION)/build/.config 2>/dev/null)
+KERNEL_CC := $(shell sed -n 's/^CONFIG_CC_IS_CLANG=y/clang/p' $(KBUILD)/.config 2>/dev/null)
+KERNEL_LD := $(shell sed -n 's/^CONFIG_LD_IS_LLD=y/lld/p' $(KBUILD)/.config 2>/dev/null)
 ifeq ($(KERNEL_CC)$(KERNEL_LD),clanglld)
   LLVM_FLAG := LLVM=1
 else ifneq ($(KERNEL_CC),)
@@ -17,10 +20,7 @@ else ifneq ($(KERNEL_CC),)
 endif
 
 all:
-	$(MAKE) -C /lib/modules/$(KVERSION)/build M=$(PWD) $(LLVM_FLAG) modules
+	$(MAKE) -C $(KBUILD) M=$(PWD) $(LLVM_FLAG) modules
 
 clean:
-	$(MAKE) -C /lib/modules/$(KVERSION)/build M=$(PWD) $(LLVM_FLAG) clean
-
-dkms:
-	sudo cp -t /usr/src/hid-switch2-1.0 switch2-usb.c switch2-ble.c Makefile hid-switch2.h hid-switch2.c hid-ids.h dkms.conf 99-switch2-controllers.rules
+	$(MAKE) -C $(KBUILD) M=$(PWD) $(LLVM_FLAG) clean
