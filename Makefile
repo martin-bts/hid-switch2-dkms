@@ -2,13 +2,13 @@ obj-m += drivers/hid/
 obj-m += drivers/input/joystick/
 
 # Enable Force Feedback support
-ccflags-y += -DCONFIG_NINTENDO_FF
+subdir-ccflags-y += -DCONFIG_NINTENDO_FF
 
 # Resolve private kernel headers (usbhid/usbhid.h) from the kernel build
 # tree when they are not overridden by local copies.
 KVERSION ?= $(shell uname -r)
 KBUILD := /lib/modules/$(KVERSION)/build
-ccflags-y += -I$(KBUILD)/drivers/hid
+subdir-ccflags-y += -I$(KBUILD)/drivers/hid
 
 # Auto-detect if the kernel was built with the full LLVM toolchain (e.g. CachyOS)
 KERNEL_CC := $(shell sed -n 's/^CONFIG_CC_IS_CLANG=y/clang/p' $(KBUILD)/.config 2>/dev/null)
