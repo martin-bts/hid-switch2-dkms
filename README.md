@@ -24,15 +24,16 @@ and is **NOT** based on this repo at all.
 
 * [BlueZ v1](https://lore.kernel.org/all/20260301152930.221472-1-martinbts@gmx.net/) was submitted in March 2026.
 * [BlueZ v2](https://lore.kernel.org/all/20260308124745.19248-1-martinbts@gmx.net/) was submitted in March 2026.
-* [BlueZ v3](https://lore.kernel.org/all/20260317202637.158997-1-martinbts@gmx.net/) was submitted in March 2026.
+* [BlueZ v3](https://lore.kernel.org/all/20260317202637.158997-1-martinbts@gmx.net/) was submitted in March 2026. (Was buggy, I am yet to resubmit the fixed version)
 
 
 ## About this project
 
-This driver is based on the HID v2 driver with Bluetooth support added
+This driver is based on the current proposed patchset to the LKML
+(this statement was true 2026-03-31), with Bluetooth support added
 on top of it. To make the controller work over Bluetooth, you need a
 patched BlueZ bluetoothd that can connect and wire the controller via
-BLE. [BlueZ v3 all-in-one patch](v3_all_in_one.patch)
+BLE. [BlueZ v3 all-in-one patch](bluez-switch2-all-v3.patch)
 
 The extension to the HID driver that allows connecting the controller
 through BLE is yet to be submitted upstream.
