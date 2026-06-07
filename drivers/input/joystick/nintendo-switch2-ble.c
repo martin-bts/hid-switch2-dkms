@@ -24,6 +24,18 @@
  *   hid_hw_output_report().  The gatt-uhid bridge reads the handle
  *   and writes the frame to that GATT characteristic.
  *
+ * Rumble path:
+ *   Rumble does not really go through the NS2 transport drivers.
+ *   hid-nintendo's rumble directly calls hid_hw_output_report(), which
+ *   ultimately calls hdev->ll_driver->output_report().
+ *   This means we have to wrap output_report() to add the rumble handle
+ *   as a prefix, so that the GATT bridge does the right thing.
+ *   Problem: when output_report() is called, we would have to parse the
+ *            payload to identify if we are seeing rumble data, or other
+ *            data.
+ *   Currently, I don't want to interprete payload data, so we go by
+ *   payload length. Luckily we don't use hid_hw_output_report() much.
+ *
  * Copyright (c) 2025 Martin BTS <martinbts@gmx.net>
  */
 
@@ -42,15 +54,26 @@
 /* GATT handle for the haptic data characteristic */
 #define NS2_GATT_HAPTIC_HANDLE	0x0012
 
+/* GATT handle for input data */
+#define NS2_GATT_INPUT_HANDLE	0x000e
+
+/* GATT handle for PDU acks */
+#define NS2_GATT_ACK_HANDLE	0x001a
+
 struct switch2_ble_ctx {
 	struct switch2_cfg_intf cfg;
 	struct switch2_controller *ns2;
 	struct hid_device *hdev;
 	char phys[64];
-	uint16_t input_handle;
-	uint16_t ack_handle;
 	bool cfg_attached;
 	struct work_struct init_work;
+	/*
+	 * Wrapped copy of this hdev's uhid ll_driver.  hdev->ll_driver is
+	 * repointed at @ll so we can intercept output_report; @orig_ll keeps
+	 * the original uhid driver to forward to.
+	 */
+	const struct hid_ll_driver *orig_ll;
+	struct hid_ll_driver ll;
 };
 
 /* ------------------------------------------------------------------ */
@@ -89,7 +112,8 @@ static int switch2_ble_send_cmd(enum switch2_cmd command, uint8_t subcommand,
 	if (msg && len)
 		memcpy(frame + GATT_HANDLE_SIZE + sizeof(header), msg, len);
 
-	ret = hid_hw_output_report(hdev, frame, frame_len);
+	/* bypass our rumble handle injecting output_report() */
+	ret = ctx->orig_ll->output_report(hdev, frame, frame_len);
 	hid_dbg(hdev, "send_cmd: cmd=0x%02x sub=0x%02x len=%zu ret=%d\n",
 		command, subcommand, frame_len, ret);
 	kfree(frame);
@@ -125,26 +149,28 @@ static void switch2_ble_init_work(struct work_struct *work)
 static int switch2_ble_raw_event(struct hid_device *hdev,
 	struct hid_report *report, uint8_t *raw_data, int size)
 {
-	struct switch2_controller *ns2 = hid_get_drvdata(hdev);
+	struct switch2_controller *ns2;
 	struct switch2_cfg_intf *cfg;
 	struct switch2_ble_ctx *ctx;
 	uint16_t handle;
 	uint8_t *payload;
 	int payload_len;
 
+	if (report->type != HID_INPUT_REPORT)
+		return 0;
+
+	if (size < 1 + GATT_HANDLE_SIZE + 1)
+		return -EINVAL;
+
+	ns2 = hid_get_drvdata(hdev)
 	if (!ns2)
 		return 0;
 
 	cfg = switch2_controller_get_cfg(ns2);
 	if (!cfg)
 		return 0;
+
 	ctx = container_of(cfg, struct switch2_ble_ctx, cfg);
-
-	if (report->type != HID_INPUT_REPORT)
-		return 0;
-
-	if (size < 1 + GATT_HANDLE_SIZE + 1)
-		return -EINVAL;
 
 	/*
 	 * First raw_event means the gatt-uhid bridge event loop is active.
@@ -158,14 +184,13 @@ static int switch2_ble_raw_event(struct hid_device *hdev,
 	payload = raw_data + 1 + GATT_HANDLE_SIZE;
 	payload_len = size - 1 - GATT_HANDLE_SIZE;
 
-	if (handle == ctx->ack_handle) {
+	switch (handle) {
+	case NS2_GATT_ACK_HANDLE:
 		hid_dbg(hdev, "ACK: %d bytes, first=%02x\n",
 			payload_len, payload_len > 0 ? payload[0] : 0);
 		switch2_receive_command(ns2, payload, payload_len);
 		return 0;
-	}
-
-	if (handle == ctx->input_handle) {
+	case NS2_GATT_INPUT_HANDLE:
 		uint8_t buf[64];
 		unsigned int orig_id = report->id;
 		uint8_t report_type;
@@ -196,11 +221,43 @@ static int switch2_ble_raw_event(struct hid_device *hdev,
 		ret = switch2_event(hdev, report, buf, payload_len + 1);
 		report->id = orig_id;
 		return ret;
-	}
-
-	hid_dbg(hdev, "unhandled handle 0x%04x, %d bytes\n", handle,
+	default:
+		hid_dbg(hdev, "unhandled handle 0x%04x, %d bytes\n", handle,
 		payload_len);
+	}
 	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Output report wrapper: inject the GATT haptic handle on rumble       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Intercepts hid_hw_output_report() on this hdev. In hid-nintendo,
+ * switch2_rumble_work() emits the raw 64-byte haptic buffer here with no
+ * transport framing; the gatt-uhid bridge demuxes outgoing reports by a
+ * 2-byte little-endian GATT handle prefix, so prepend the haptic
+ * characteristic handle (0x0012).  Command writes go straight to
+ * orig_ll->output_report (see switch2_ble_send_cmd()) and never reach this
+ * path, so anything arriving here is a rumble frame.
+ */
+static int switch2_ble_output_report(struct hid_device *hdev, uint8_t *buf,
+	size_t len)
+{
+	struct switch2_ble_ctx *ctx =
+		container_of(hdev->ll_driver, struct switch2_ble_ctx, ll);
+	uint8_t frame[GATT_HANDLE_SIZE + 64];
+
+	/* Only the raw 64-byte rumble buffer is expected; pass anything
+	 * unexpected through unchanged. */
+	if (len != 64)
+		return ctx->orig_ll->output_report(hdev, buf, len);
+
+	frame[0] = NS2_GATT_HAPTIC_HANDLE & 0xff;
+	frame[1] = (NS2_GATT_HAPTIC_HANDLE >> 8) & 0xff;
+	memcpy(frame + GATT_HANDLE_SIZE, buf, 64);
+
+	return ctx->orig_ll->output_report(hdev, frame, sizeof(frame));
 }
 
 /* ------------------------------------------------------------------ */
@@ -254,12 +311,11 @@ static int switch2_ble_probe(struct hid_device *hdev,
 	ctx->cfg.dev = &hdev->dev;
 	ctx->cfg.send_command = switch2_ble_send_cmd;
 
-	/*
-	 * GATT handles for routing incoming notifications.
-	 * TODO: discover from bridge or feature report.
-	 */
-	ctx->input_handle = 0x000e;
-	ctx->ack_handle   = 0x001a;
+	/* copy the ll_driver and put our output_report() wrapper in place */
+	ctx->orig_ll = hdev->ll_driver;
+	ctx->ll = *hdev->ll_driver;
+	ctx->ll.output_report = switch2_ble_output_report;
+	hdev->ll_driver = &ctx->ll;
 
 	INIT_WORK(&ctx->init_work, switch2_ble_init_work);
 
@@ -297,6 +353,9 @@ static void switch2_ble_remove(struct hid_device *hdev)
 
 	ctx = container_of(cfg, struct switch2_ble_ctx, cfg);
 	cancel_work_sync(&ctx->init_work);
+
+	if (ctx->orig_ll)
+		hdev->ll_driver = ctx->orig_ll;
 
 	if (ctx->cfg_attached)
 		switch2_controller_detach_cfg(ns2);
