@@ -162,7 +162,7 @@ static int switch2_ble_raw_event(struct hid_device *hdev,
 	if (size < 1 + GATT_HANDLE_SIZE + 1)
 		return -EINVAL;
 
-	ns2 = hid_get_drvdata(hdev)
+	ns2 = hid_get_drvdata(hdev);
 	if (!ns2)
 		return 0;
 
