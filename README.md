@@ -18,7 +18,8 @@ and is **NOT** based on this repo at all.
 * [HID v1](https://lore.kernel.org/all/20251120022457.469342-1-vi@endrift.com/) was submitted in November 2025.
 * [HID v2](https://lore.kernel.org/all/20260109034034.565630-2-vi@endrift.com/) in January 2026.
 * [Out-of-tree version](https://github.com/Senko-p/hid-switch2-dkms) (now archived) created by Senko-p.
-* [In March 2026](https://lore.kernel.org/all/941e5399-be1c-4e19-b1d4-04ff9ec2a32b@endrift.com/) it seems the kernel driver is still a long way away.
+* [In March 2026](https://lore.kernel.org/all/941e5399-be1c-4e19-b1d4-04ff9ec2a32b@endrift.com/) it seemed the kernel driver was still a long way away.
+* [HID v12](https://lore.kernel.org/all/20260715033409.3599913-1-vi@endrift.com/) in July 2026. The AI is still providing valueable feedback.
 
 ### Bluetooth support in BlueZ
 
@@ -30,8 +31,8 @@ and is **NOT** based on this repo at all.
 ## About this project
 
 This driver is based on the current proposed patchset to the LKML
-(this statement was true 2026-03-31), with Bluetooth support added
-on top of it. To make the controller work over Bluetooth, you need a
+(tracking [PATCH v12](https://lore.kernel.org/all/20260715033409.3599913-1-vi@endrift.com/)
+as of 2026-07-19), with Bluetooth support added on top of it. To make the controller work over Bluetooth, you need a
 patched BlueZ bluetoothd that can connect and wire the controller via
 BLE. [BlueZ v3 all-in-one patch](bluez-switch2-all-v3.patch)
 
