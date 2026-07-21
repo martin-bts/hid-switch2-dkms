@@ -19,6 +19,8 @@ else ifneq ($(KERNEL_CC),)
   LLVM_FLAG := CC=clang
 endif
 
+DRIVER_FILES := $(shell find drivers -type f)
+
 all:
 	$(MAKE) -C $(KBUILD) M=$(PWD) $(LLVM_FLAG) modules
 
@@ -38,7 +40,7 @@ dkms-install: dkms-src
 	sudo dkms build $(DKMS_NAME)/$(DKMS_VERSION)
 	sudo dkms install $(DKMS_NAME)/$(DKMS_VERSION)
 
-dkms-src:
+dkms-src: VERSION $(DRIVER_FILES)
 	sudo mkdir -p $(DKMS_DEST)/drivers/hid $(DKMS_DEST)/drivers/input/joystick
 	sudo cp Makefile VERSION $(DKMS_DEST)/
 	sudo cp drivers/hid/Makefile \
